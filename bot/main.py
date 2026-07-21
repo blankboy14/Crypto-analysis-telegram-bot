@@ -38,6 +38,16 @@ import os
 import re
 import sys
 
+import os
+import sys
+
+# Make sure the project root (parent of this 'bot' folder) is on sys.path.
+# This lets the file work whether it's launched as `python -m bot.main`
+# or run directly as `python bot/main.py` (some hosting platforms do the latter).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import yaml
 from dotenv import load_dotenv
 from telegram import Update
