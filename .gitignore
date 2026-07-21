@@ -1,0 +1,20 @@
+# Secrets - never commit real tokens/keys
+.env
+
+# Runtime data
+logs/
+database/bot_state.db
+database/*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Editor/OS cruft
+.vscode/
+.DS_Store
+Thumbs.db

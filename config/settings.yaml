@@ -1,0 +1,74 @@
+# settings.yaml
+# Central config for the bot. Secrets (bot token, API keys) live in
+# .env instead - this file is for tunable numbers/behaviour only, and
+# is safe to commit to git.
+
+analysis:
+  min_ticks_before_analysis: 5
+  max_history_per_symbol: 300
+
+indicators:
+  rsi:
+    period: 14
+    overbought: 70
+    oversold: 30
+  ema:
+    fast_period: 9
+    slow_period: 21
+  macd:
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+  bollinger:
+    period: 20
+    num_std: 2
+  support_resistance:
+    lookback: 50
+
+risk_management:
+  stop_loss_pct_of_range: 0.30
+  take_profit_pct_of_range: 0.60
+  fallback_range_pct: 0.01
+
+signal_scoring:
+  buy_threshold: 2
+  sell_threshold: -2
+
+# --- Phase 2.1: "24/7 Market Analyse" volume-spike watcher ---
+volume_spike_watch:
+  poll_interval_seconds: 15
+  # % move within one poll window that counts as "suddenly moving" for
+  # a normal pair (per the spec: e.g. 20-40% in a short burst).
+  spike_pct_threshold: 20.0
+  # BTC gets a separate, much tighter threshold since the spec calls
+  # out that BTC essentially never does 20-40% moves - a smaller move
+  # is already noteworthy for it.
+  btc_spike_pct_threshold: 5.0
+  btc_symbol: "BTCUSDT"
+  # Don't re-alert the same pair/direction again within this window.
+  cooldown_seconds: 900
+
+# --- Phase 2.2: "Find Strong Signal" 24/7 scanner ---
+strong_signal_watch:
+  # How often to re-run a full market scan while this mode is ON.
+  scan_interval_seconds: 900
+  # Only push a signal to the user once its confidence is at/above this.
+  min_confidence_to_push: 80
+  worker_count: 8
+  # Don't push the exact same pair+verdict again within this window.
+  cooldown_seconds: 3600
+
+# --- Phase 2.3: "Search Signal" one-shot scan ---
+search_signal:
+  worker_count: 8
+  top_n: 3
+
+symbols:
+  watchlist:
+    - "BTCUSDT"
+    - "ETHUSDT"
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_file_path: "logs/bot_log.txt"
