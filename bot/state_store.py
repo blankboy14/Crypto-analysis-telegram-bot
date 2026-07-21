@@ -14,6 +14,8 @@ and jobs don't each need their own file-reading logic.
 Schema is created on import if it doesn't exist yet - nothing else
 needs to run a separate migration step first.
 """
+from __future__ import annotations
+
 import json
 import logging
 import os
