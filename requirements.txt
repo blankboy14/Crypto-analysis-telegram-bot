@@ -2,7 +2,7 @@
 # NOTE: must be >=22.4 - earlier releases aren't compatible with Python
 # 3.14 (Application.__init__ hits "AttributeError: ... no __dict__ for
 # setting new attributes" on 3.14 specifically; PTB 22.4 fixed this).
-python-telegram-bot>=22.4
+python-telegram-bot[job-queue]>=22.4
 
 # Engine dependencies (carried over from the reused analysis engine)
 requests>=2.31.0
