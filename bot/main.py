@@ -173,9 +173,32 @@ def build_application(settings: dict) -> Application:
     return application
 
 
+def _start_health_server() -> None:
+    """Start a tiny HTTP server so Render detects an open port (free Web Service requirement)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, *args):  # silence access logs
+            pass
+
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("Health-check server listening on port %s", port)
+
+
 def main() -> None:
     settings = load_settings()
     configure_logging(settings)
+
+    _start_health_server()
 
     application = build_application(settings)
 
