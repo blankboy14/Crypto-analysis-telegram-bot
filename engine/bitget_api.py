@@ -8,6 +8,30 @@ import time
 
 from .http_client import http_session as _http_session, log
 
+
+def _parse_pct_change(raw):
+    """
+    Bitget's change24h comes back as a raw STRING, and it's a decimal
+    FRACTION of price change (e.g. "0.0523" for +5.23%), not already a
+    percentage - confirmed from Bitget's own API docs example
+    (BTCUSDT change24h: "0.00069"). Two bugs stacked here previously:
+    this field was passed straight through unconverted, so (1) it was
+    always a str, never an int/float, which meant every downstream
+    `isinstance(change24h, (int, float))` display check (see
+    bot/formatters.py) failed and showed "N/A" for essentially every
+    pair - not intermittently, every single one; and (2) even a naive
+    float(raw) without the *100 would have been off by 100x once that
+    display bug was fixed. This returns an actual percentage float
+    (or None if the field is missing/blank/unparseable, so callers can
+    tell "no data" apart from a genuine 0.00%).
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw) * 100
+    except (TypeError, ValueError):
+        return None
+
 # --- Bitget public candle APIs (spot + futures/mix) - no key needed ---
 BITGET_SPOT_CANDLES_URL = "https://api.bitget.com/api/v2/spot/market/candles"
 BITGET_FUTURES_CANDLES_URL = "https://api.bitget.com/api/v2/mix/market/candles"
@@ -98,6 +122,23 @@ DEFAULT_CANDLE_COUNTS = {
 # retrieves the real depth of history that's available.
 BITGET_MAX_LIMIT_PER_CALL = 200
 
+# Some symbols Bitget lists in its spot ticker feed (e.g. its tokenized
+# real-world-stock products - "RHOOD", "RCOIN", "RTSLA"-style pairs
+# mirroring actual stock tickers) don't support the regular kline/
+# candles endpoint the same way normal crypto pairs do, and Bitget
+# rejects them with a hard "Parameter validation failed" (code 48001) -
+# not a transient error, the same call will fail again every time.
+# Without this cache, every full market scan (Search Signal, Strong
+# Signal watcher) re-requests candles for these same known-bad symbols
+# every single cycle, forever - pure wasted API calls + log spam, since
+# the outcome never changes. This remembers the failure per
+# (base_url, symbol, granularity) and skips straight to returning None
+# for BAD_SYMBOL_CACHE_TTL_SECONDS, then quietly retries once that
+# expires (in case Bitget adds support later) instead of blocking it
+# forever on what might turn out to be a stale assumption.
+_bad_symbol_cache: dict[tuple, float] = {}
+BAD_SYMBOL_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours - these are static "unsupported product" facts, not flaky
+
 
 def _fetch_bitget_paginated(base_url, symbol, granularity_key, limit, granularity_map,
                              extra_params=None, history_url=None, history_granularity_map=None,
@@ -129,6 +170,11 @@ def _fetch_bitget_paginated(base_url, symbol, granularity_key, limit, granularit
         limit = DEFAULT_CANDLE_COUNTS.get(granularity_key, 200)
 
     clean_symbol = "".join(c for c in symbol if c.isalnum()).upper()
+
+    cache_key = (base_url, clean_symbol, granularity_key)
+    marked_bad_at = _bad_symbol_cache.get(cache_key)
+    if marked_bad_at is not None and (time.time() - marked_bad_at) < BAD_SYMBOL_CACHE_TTL_SECONDS:
+        return None
 
     all_candles = []
     end_time = None
@@ -164,6 +210,12 @@ def _fetch_bitget_paginated(base_url, symbol, granularity_key, limit, granularit
                 # error") instead of just "400 Bad Request" - much easier to
                 # diagnose real parameter issues from this.
                 log.error(f"Bitget API error {resp.status_code} for {params}: {resp.text[:300]}")
+                if resp.status_code == 400:
+                    try:
+                        if resp.json().get("code") == "48001":
+                            _bad_symbol_cache[cache_key] = time.time()
+                    except ValueError:
+                        pass  # response body wasn't JSON - nothing to cache, just fall through to raise_for_status
                 resp.raise_for_status()
             rows = resp.json().get("data", [])
 
@@ -242,7 +294,7 @@ def fetch_bitget_spot_tickers():
             "symbol": format_symbol_display(r["symbol"]),
             "rawSymbol": r["symbol"],
             "lastPrice": float(r.get("lastPr") or 0),
-            "change24h": r.get("change24h"),
+            "change24h": _parse_pct_change(r.get("change24h")),
             "high24h": r.get("high24h"),
             "low24h": r.get("low24h"),
             "usdtVolume24h": float(r.get("usdtVolume") or 0),
@@ -265,7 +317,7 @@ def fetch_bitget_futures_tickers(product_type="usdt-futures"):
             "symbol": format_symbol_display(r["symbol"]),
             "rawSymbol": r["symbol"],
             "lastPrice": float(r.get("lastPr") or 0),
-            "change24h": r.get("change24h"),
+            "change24h": _parse_pct_change(r.get("change24h")),
             "high24h": r.get("high24h"),
             "low24h": r.get("low24h"),
             "usdtVolume24h": float(r.get("usdtVolume") or 0),

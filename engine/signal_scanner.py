@@ -32,7 +32,7 @@ from engine.indicators import compute_all_indicators
 from engine.trading_concepts.analysis import compute_all_concepts
 from engine.trading_concepts.support_resistance import analyze_support_resistance
 from engine.indicators.atr import compute_atr
-from engine.signal_engine import compute_overall_signal, WEIGHTS
+from engine.signal_engine import compute_overall_signal, WEIGHTS, INDICATOR_VOTE_KEYS, CONCEPT_VOTE_KEYS
 
 log = logging.getLogger("crypto-analyzer-http")
 
@@ -155,6 +155,7 @@ def analyze_pair_multi_timeframe(raw_symbol, exchange, enabled_indicators, enabl
         per_tf[tf] = {
             "score": signal["score"], "confidence": signal["confidence"],
             "verdict": signal["verdict"], "voteCount": signal["voteCount"],
+            "votes": signal["votes"],
         }
         candles_by_tf[tf] = candles
 
@@ -268,7 +269,26 @@ def build_explanation(mtf_result, order_flow_folded_in, news_item, verdict):
     return " ".join(parts)
 
 
-def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enabled_indicators, enabled_concepts, news_items):
+def summarize_votes(votes):
+    """
+    Splits a timeframe's raw vote list (signal["votes"]) into short,
+    human-readable "indicator info" / "concept info" one-liners for the
+    bot's Search Signal full-analysis mode - e.g.
+    "RSI 28.4 (oversold) bullish, MACD histogram +0.0012 bullish".
+    Returns (indicator_text, concept_text); either is "No clear signal"
+    if that family had no opinion on this timeframe.
+    """
+    def _fmt(vs):
+        if not vs:
+            return "No clear signal"
+        return ", ".join(f"{v['note']} ({'bullish' if v['direction'] > 0 else 'bearish'})" for v in vs)
+
+    indicator_votes = [v for v in votes if v["key"] in INDICATOR_VOTE_KEYS]
+    concept_votes = [v for v in votes if v["key"] in CONCEPT_VOTE_KEYS]
+    return _fmt(indicator_votes), _fmt(concept_votes)
+
+
+def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enabled_indicators, enabled_concepts, news_items, change_24h=None):
     """
     Full per-pair pipeline: liquidity gate -> multi-timeframe signal ->
     order flow -> news -> tradeable decision -> (if tradeable)
@@ -278,7 +298,9 @@ def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enab
     """
     result = {
         "symbol": display_symbol, "rawSymbol": raw_symbol, "exchange": exchange,
-        "usdtVolume24h": usdt_volume_24h, "tradeable": False, "reason": None,
+        "usdtVolume24h": usdt_volume_24h, "change24h": change_24h,
+        "tradeable": False, "reason": None,
+        "indicatorInfo": "Not enough data", "conceptInfo": "Not enough data",
     }
 
     if usdt_volume_24h < MIN_USDT_VOLUME_24H:
@@ -295,6 +317,10 @@ def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enab
     if mtf is None:
         result["reason"] = "Not enough candle history on enough timeframes yet"
         return result
+
+    primary_tf = mtf.get("primaryTimeframe")
+    primary_votes = mtf["perTimeframe"].get(primary_tf, {}).get("votes", []) if primary_tf else []
+    result["indicatorInfo"], result["conceptInfo"] = summarize_votes(primary_votes)
 
     order_flow_live = None
     try:
@@ -324,6 +350,10 @@ def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enab
         "primaryTimeframe": mtf["primaryTimeframe"], "orderFlowFoldedIn": flow_folded_in,
     }
     result["orderFlow"] = order_flow_live
+    if order_flow_live and order_flow_live.get("buyPct") is not None:
+        result["orderFlowInfo"] = f"{order_flow_live['buyPct']:.1f}% buy-side tape"
+    else:
+        result["orderFlowInfo"] = "No live tape data"
     result["newsImpact"] = news_item
 
     if mtf["agreementCount"] < MIN_TIMEFRAME_AGREEMENT:
@@ -359,13 +389,28 @@ def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enab
     return result
 
 
-def run_full_scan(job, scope, enabled_indicators, enabled_concepts, worker_count=8):
+def run_full_scan(job, scope, enabled_indicators, enabled_concepts, worker_count=8,
+                   on_pair=None, on_progress=None):
     """
     Runs in a background thread (see http_server.py's
     /api/signal-scan/start) - scans every pair in `scope`
     ("bitget-spot" | "bitget-futures"), highest 24h% first down to the
     biggest losers, updating `job` in place as results stream in so the
     frontend's progress poll always has the latest partial state.
+
+    `on_pair` (optional): called with each individual result dict the
+    moment it's ready - used by the bot's Search Signal "Full Analysis"
+    mode to stream per-pair detail messages as the scan runs, instead
+    of waiting for everything to finish.
+    `on_progress` (optional): called with (completed_count, total_count)
+    after every single pair finishes - used to drive the bot's
+    10/25/50/75/100% progress messages. Both callbacks run on THIS
+    worker thread (not the caller's event loop) - callers that need to
+    touch asyncio/Telegram from them are responsible for hopping back
+    onto their own loop (e.g. via asyncio.run_coroutine_threadsafe).
+    Any exception raised by either callback is caught and logged here
+    so a bot-side formatting/sending bug can never abort the scan
+    itself - the two concerns stay isolated from each other.
     """
     tokens = get_token_list(scope)["tokens"]
     # Highest 24h% first, down to the biggest losers - per the explicit
@@ -389,6 +434,7 @@ def run_full_scan(job, scope, enabled_indicators, enabled_concepts, worker_count
         return analyze_one_pair(
             token["rawSymbol"], token["symbol"], scope,
             token.get("usdtVolume24h", 0), enabled_indicators, enabled_concepts, news_items,
+            change_24h=token.get("change24h"),
         )
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
@@ -409,6 +455,17 @@ def run_full_scan(job, scope, enabled_indicators, enabled_concepts, worker_count
                 continue
             job["results"][result["rawSymbol"]] = result
             job["completed"] += 1
+
+            if on_pair is not None:
+                try:
+                    on_pair(result)
+                except Exception as exc:
+                    log.error(f"Signal scan: on_pair callback failed for {result.get('rawSymbol')}: {exc}")
+            if on_progress is not None:
+                try:
+                    on_progress(job["completed"], job["total"])
+                except Exception as exc:
+                    log.error(f"Signal scan: on_progress callback failed: {exc}")
 
     tradeable = [r for r in job["results"].values() if r.get("tradeable")]
     tradeable.sort(key=lambda r: r.get("rankScore", 0), reverse=True)
@@ -443,7 +500,25 @@ def _new_job():
     }
 
 
-def scan_market(market, enabled_indicators, enabled_concepts, worker_count=8):
+def count_pairs(market):
+    """
+    Quick "how many pairs would a scan of this market cover" count,
+    with NO analysis run - just the token list length(s). Cheap even
+    on a cold cache (one Bitget REST call per scope; get_token_list()
+    caches the response afterwards so the run_full_scan() that
+    typically follows moments later reuses it). Used by the bot's
+    Search Signal flow to show "Total pairs: N" up front, before the
+    user commits to Full Analysis vs Skip Analysis Detail.
+    """
+    scopes = MARKET_SCOPE_MAP.get(market)
+    if not scopes:
+        raise ValueError(f"Unknown market choice: {market!r} (expected spot/future/both)")
+    per_scope = {scope: len(get_token_list(scope)["tokens"]) for scope in scopes}
+    return {"perScope": per_scope, "total": sum(per_scope.values())}
+
+
+def scan_market(market, enabled_indicators, enabled_concepts, worker_count=8,
+                 on_pair=None, on_progress=None, on_total=None):
     """
     market: "spot" | "future" | "both" - as chosen via the bot's
     Spot/Future/Both prompt (market_select.py).
@@ -460,6 +535,15 @@ def scan_market(market, enabled_indicators, enabled_concepts, worker_count=8):
 
     Each result dict's "multiTimeframe"->"combinedConfidence" is the
     0-100 confidence level the bot messages show (Phase 2.2/2.3).
+
+    `on_total(total_count)`: called once, before any pair is analyzed,
+    with the combined pair count across every scope in `market` (so
+    "both" reports one grand total, not two separate ones).
+    `on_pair(result)` / `on_progress(completed, total)`: same contract
+    as run_full_scan()'s callbacks, but `completed`/`total` here are
+    running totals across ALL scopes in `market`, so a "both" scan's
+    progress reads as one continuous 0-100% instead of restarting at
+    a new 0% when it moves from spot to futures.
     """
     scopes = MARKET_SCOPE_MAP.get(market)
     if not scopes:
@@ -468,10 +552,31 @@ def scan_market(market, enabled_indicators, enabled_concepts, worker_count=8):
     merged_tradeable = []
     scanned = 0
 
+    if on_total is not None or on_progress is not None:
+        combined_total = sum(len(get_token_list(scope)["tokens"]) for scope in scopes)
+        if on_total is not None:
+            try:
+                on_total(combined_total)
+            except Exception as exc:
+                log.error(f"Signal scan: on_total callback failed: {exc}")
+    else:
+        combined_total = 0
+
+    completed_so_far = 0
+
+    def _wrapped_progress(scope_completed, scope_total):
+        if on_progress is None:
+            return
+        on_progress(completed_so_far + scope_completed, combined_total)
+
     for scope in scopes:
         job = _new_job()
-        run_full_scan(job, scope, enabled_indicators, enabled_concepts, worker_count=worker_count)
+        run_full_scan(
+            job, scope, enabled_indicators, enabled_concepts, worker_count=worker_count,
+            on_pair=on_pair, on_progress=_wrapped_progress,
+        )
         scanned += job["completed"]
+        completed_so_far += job["completed"]
         merged_tradeable.extend(r for r in job["results"].values() if r.get("tradeable"))
 
     merged_tradeable.sort(key=lambda r: r.get("rankScore", 0), reverse=True)

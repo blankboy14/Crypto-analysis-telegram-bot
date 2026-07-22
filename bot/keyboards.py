@@ -11,10 +11,11 @@ retyping the string. One typo in a duplicated literal is a silent bug
 (the button press would never match any handler) - this file is the
 single source of truth for the exact wording.
 
-NOTE: this is the *main* menu only (the 5 buttons from Phase 1.2). The
+NOTE: this is the *main* menu only (the buttons from Phase 1.2, plus
+the Status and Single Pair Analyse buttons added later). The
 "Spot / Future / Both" inline keyboard that appears after picking any
-of the three mode buttons is common to all three and belongs in
-bot/handlers/market_select.py per the file plan, not here.
+of the mode buttons that need a market choice is common to all of them
+and belongs in bot/handlers/market_select.py per the file plan, not here.
 """
 
 from telegram import ReplyKeyboardMarkup
@@ -22,17 +23,27 @@ from telegram import ReplyKeyboardMarkup
 # --- Phase 1.2 button labels ---
 BTN_MARKET_ANALYSE_ON = "📊 24/7 Market Analyse"
 BTN_MARKET_ANALYSE_OFF = "🔕 24/7 Off Market Analyse"
+BTN_MARKET_ANALYSE_STATUS = "📈 24/7 Market Analyse — Status"
 BTN_STRONG_SIGNAL_ON = "🔥 Find 24/7 Strong Signal"
 BTN_STRONG_SIGNAL_OFF = "🛑 Off 24/7 Find Signal"
+BTN_STRONG_SIGNAL_STATUS = "📈 Find 24/7 Strong Signal — Status"
 BTN_SEARCH_SIGNAL = "🔎 Search Signal"
+BTN_SINGLE_PAIR_ANALYSE = "🎯 Single Pair Analyse"
+BTN_MARKET_DETAILS = "📋 Market Details"
+BTN_HELP = "ℹ️ Help"
 
 # Order here = order shown on the keyboard (top to bottom).
 MAIN_MENU_BUTTONS = [
     BTN_MARKET_ANALYSE_ON,
     BTN_MARKET_ANALYSE_OFF,
+    BTN_MARKET_ANALYSE_STATUS,
     BTN_STRONG_SIGNAL_ON,
     BTN_STRONG_SIGNAL_OFF,
+    BTN_STRONG_SIGNAL_STATUS,
     BTN_SEARCH_SIGNAL,
+    BTN_SINGLE_PAIR_ANALYSE,
+    BTN_MARKET_DETAILS,
+    BTN_HELP,
 ]
 
 

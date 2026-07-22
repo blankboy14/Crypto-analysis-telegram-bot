@@ -32,9 +32,10 @@ import logging
 import time
 
 from engine.bitget_api import get_token_list
+from engine.order_flow import get_order_flow
 from engine.signal_scanner import MARKET_SCOPE_MAP
 from bot import state_store
-from bot.formatters import format_volume_spike_alert
+from bot.formatters import format_volume_spike_alert, format_volume_burst_alert
 
 log = logging.getLogger("crypto-telegram-bot")
 
@@ -53,6 +54,110 @@ _last_alert: dict[tuple[int, str, str], float] = {}
 # Keep enough history that a slightly-late tick can still find a
 # reasonable baseline to compare against.
 _HISTORY_MAX_AGE_SECONDS = 180
+
+# --- volume burst tracking (separate from the price-spike state above) ---
+
+# (exchange, raw_symbol) -> [(timestamp, usdtVolume24h), ...], same
+# rolling-history idea as _price_history but for the ticker's rolling
+# 24h volume figure. Consecutive samples' DIFFERENCE approximates how
+# much actually traded in that interval (the 24h window itself slides
+# forward continuously, so this is a proxy, not an exact figure - but
+# it's the only volume signal a ticker snapshot gives us without
+# pulling the full trade tape for every pair on every tick).
+_volume_history: dict[tuple[str, str], list[tuple[float, float]]] = {}
+
+# (exchange, raw_symbol) -> [interval_delta, ...], most recent last,
+# capped at _VOLUME_DELTA_HISTORY_MAX - this is the rolling baseline a
+# new interval's delta gets compared against.
+_volume_deltas: dict[tuple[str, str], list[float]] = {}
+_VOLUME_DELTA_HISTORY_MAX = 20
+
+
+def _trim_volume_history(key: tuple, now: float) -> None:
+    samples = _volume_history.get(key)
+    if not samples:
+        return
+    cutoff = now - _HISTORY_MAX_AGE_SECONDS
+    i = 0
+    while i < len(samples) and samples[i][0] < cutoff:
+        i += 1
+    if i:
+        del samples[:i]
+
+
+def _find_volume_baseline(key: tuple, now: float, target_age: float):
+    """Same "closest sample to target_age" logic as _find_baseline(), applied to the volume history instead of price."""
+    samples = _volume_history.get(key)
+    if not samples:
+        return None
+    candidates = [(abs((now - ts) - target_age), vol) for ts, vol in samples if now - ts >= target_age * 0.5]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    return candidates[0][1]
+
+
+def _detect_volume_bursts(scopes: list, cfg: dict) -> list:
+    """
+    Flags pairs whose traded volume THIS interval is far above their
+    own recent baseline - e.g. a pair that's been quiet suddenly sees a
+    burst of real activity. Independent of the price-spike check above
+    (a volume burst can happen with little price movement yet, which is
+    exactly the "catch it before/as it moves" case being asked for).
+    """
+    now = time.time()
+    poll_interval = cfg.get("poll_interval_seconds", 15)
+    multiplier = cfg.get("volume_burst_multiplier", 5.0)
+    min_samples = cfg.get("volume_burst_min_samples", 5)
+    # Optional filter: only alert bursts on pairs whose baseline
+    # interval volume was itself small (i.e. it really was "quiet"
+    # before this) - 0 disables the filter and considers every pair.
+    low_floor = cfg.get("volume_burst_low_floor_usdt", 0)
+
+    events = []
+    for scope in scopes:
+        try:
+            tokens = get_token_list(scope)["tokens"]
+        except Exception as exc:
+            log.error(f"Volume burst watch: token list fetch failed for {scope}: {exc}")
+            continue
+
+        for token in tokens:
+            raw_symbol = token["rawSymbol"]
+            vol24h = token.get("usdtVolume24h")
+            if not vol24h:
+                continue
+
+            key = (scope, raw_symbol)
+            baseline_vol = _find_volume_baseline(key, now, poll_interval)
+
+            history = _volume_history.setdefault(key, [])
+            history.append((now, vol24h))
+            _trim_volume_history(key, now)
+
+            if baseline_vol is None:
+                continue  # still warming up - nothing to compare against yet
+
+            interval_delta = vol24h - baseline_vol
+            deltas = _volume_deltas.setdefault(key, [])
+
+            if interval_delta > 0 and len(deltas) >= min_samples:
+                recent = deltas[-min_samples:]
+                baseline_avg = sum(recent) / len(recent)
+                if baseline_avg > 0 and interval_delta >= baseline_avg * multiplier:
+                    if low_floor <= 0 or baseline_avg <= low_floor:
+                        events.append({
+                            "exchange": scope, "rawSymbol": raw_symbol, "symbol": token["symbol"],
+                            "lastPrice": token.get("lastPrice"), "intervalVolume": interval_delta,
+                            "baselineVolume": baseline_avg, "multiplier": interval_delta / baseline_avg,
+                        })
+
+            if interval_delta > 0:
+                deltas.append(interval_delta)
+                if len(deltas) > _VOLUME_DELTA_HISTORY_MAX:
+                    del deltas[: len(deltas) - _VOLUME_DELTA_HISTORY_MAX]
+
+    return events
 
 
 def _trim_history(key: tuple, now: float) -> None:
@@ -189,5 +294,47 @@ async def tick(context) -> None:
             )
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
             _last_alert[cooldown_key] = now
+            state_store.log_alert(
+                chat_id, event["exchange"], event["rawSymbol"], event["symbol"],
+                event["direction"], event["pctChange"], event["lastPrice"],
+            )
         except Exception as exc:
             log.error(f"Volume spike watch: failed to send alert to chat {chat_id}: {exc}")
+
+    # --- volume burst check (real traded volume, independent of price) ---
+    try:
+        volume_events = _detect_volume_bursts(scopes, cfg)
+    except Exception as exc:
+        log.error(f"Volume burst watch: tick failed for chat {chat_id}: {exc}")
+        return
+
+    for event in volume_events:
+        cooldown_key = (chat_id, event["rawSymbol"], "volume")
+        last = _last_alert.get(cooldown_key, 0)
+        if now - last < cooldown_seconds:
+            continue
+
+        buy_pct = None
+        try:
+            flow = get_order_flow(event["rawSymbol"], event["exchange"], bucket_seconds=60)
+            if flow:
+                live = flow.get("live") or {}
+                recent = live.get("last60s") or live
+                buy_pct = recent.get("buyPct")
+        except Exception as exc:
+            log.error(f"Volume burst watch: order flow fetch failed for {event['rawSymbol']}: {exc}")
+
+        try:
+            text = format_volume_burst_alert(
+                pair=event["symbol"], last_price=event["lastPrice"],
+                interval_volume=event["intervalVolume"], baseline_volume=event["baselineVolume"],
+                multiplier=event["multiplier"], market=market, buy_pct=buy_pct,
+            )
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            _last_alert[cooldown_key] = now
+            state_store.log_alert(
+                chat_id, event["exchange"], event["rawSymbol"], event["symbol"],
+                "volume", event["multiplier"], event["lastPrice"],
+            )
+        except Exception as exc:
+            log.error(f"Volume burst watch: failed to send alert to chat {chat_id}: {exc}")

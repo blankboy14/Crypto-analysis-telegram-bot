@@ -1,5 +1,7 @@
 # change_of_character.py - Change of Character (CHoCH)
+
 # BUILDING BLOCK - used by ict.py and smc.py. The early-warning
+
 # opposite of break_of_structure.py: CHoCH is the FIRST break AGAINST
 # the prevailing structure (a potential trend reversal), while BOS is
 # a break WITH the prevailing structure (continuation).

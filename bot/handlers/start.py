@@ -16,14 +16,19 @@ from bot.keyboards import main_menu_keyboard
 log = logging.getLogger("crypto-telegram-bot")
 
 WELCOME_TEXT = (
-    "👋 Welcome to the Crypto Signal Bot.\n\n"
-    "Choose an option below:\n\n"
-    "📊 *24/7 Market Analyse* — alerts you the moment a pair suddenly "
-    "spikes in volume/price\n"
-    "🔥 *Find 24/7 Strong Signal* — keeps scanning and pushes high-"
-    "confidence (80%+) trade setups as they appear\n"
-    "🔎 *Search Signal* — one-shot scan, gives you the current top 3 "
-    "setups right now"
+    "👋 *Welcome to the Crypto Signal Bot*\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "📊 *24/7 Market Analyse*\n"
+    "Alerts you the moment a pair suddenly spikes in volume or price.\n\n"
+    "🔥 *Find 24/7 Strong Signal*\n"
+    "Keeps scanning non-stop and pushes high-confidence (80%+) trade "
+    "setups the moment they appear.\n\n"
+    "🔎 *Search Signal*\n"
+    "One-shot scan — gives you the current top 3 setups right now.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Not sure what a button does? Tap *ℹ️ Help* below anytime for a "
+    "full breakdown of every option.\n\n"
+    "Choose an option below to get started 👇"
 )
 
 

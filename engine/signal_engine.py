@@ -191,6 +191,7 @@ def compute_overall_signal(indicators, concepts, order_flow_live, last_close=Non
             "bullishSignals": [],
             "bearishSignals": [],
             "voteCount": 0,
+            "votes": [],
         }
 
     raw_score = sum(v["weight"] * v["direction"] for v in votes) / total_weight * 100
@@ -219,7 +220,24 @@ def compute_overall_signal(indicators, concepts, order_flow_live, last_close=Non
         "bullishSignals": bullish,
         "bearishSignals": bearish,
         "voteCount": len(votes),
+        # Raw {key, weight, direction, note} votes - kept alongside the
+        # already-existing bullish/bearish note lists (unchanged, so
+        # nothing that read those before breaks). Added so callers can
+        # tell an indicator's vote (e.g. "rsi") apart from a trading
+        # concept's vote (e.g. "trendStructure") by key, which the note
+        # strings alone don't make easy to do reliably.
+        "votes": votes,
     }
+
+
+# Fixed classification of every vote `key` above into which of the two
+# analysis families it belongs to - used by callers (e.g. the bot's
+# Search Signal full-analysis mode) that want to show "indicator info"
+# and "concept info" as separate lines instead of one merged list.
+# orderFlow is deliberately its own third bucket (live tape, not a
+# chart-derived indicator/concept) - see result["orderFlow"] instead.
+INDICATOR_VOTE_KEYS = {"rsi", "stochRsi", "macd", "mfi", "cci", "adx", "superTrend", "bollinger", "vwap"}
+CONCEPT_VOTE_KEYS = {"trendStructure", "changeOfCharacter", "breakOfStructure", "liquiditySweeps"}
 
 
 def build_chart_markers(concepts):

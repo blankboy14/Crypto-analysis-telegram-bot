@@ -6,18 +6,9 @@ delivered through a Telegram bot instead of a browser dashboard.
 
 ## Build status
 
-This project is being built incrementally. What exists right now:
-
-| File | Status |
-|---|---|
-| `.env` / `.env.example` | ✅ done |
-| `.gitignore` | ✅ done |
-| `requirements.txt` | ✅ done |
-| `config/settings.yaml` | ✅ done |
-| `engine/news_service.py` | ✅ done (AI/Claude classification removed - see file header) |
-| everything else in the file plan (`bot/`, `jobs/`, `database/`, rest of `engine/`, `tests/`) | ⏳ not yet - carried over from the old web project or still to be written |
-
-Don't try to run `bot/main.py` yet - it doesn't exist in this drop.
+This project is complete - every file in the file plan (`bot/`,
+`jobs/`, `database/`, `engine/`, `tests/`) is implemented and the bot
+runs end to end via `python -m bot.main`.
 
 ## Setup
 
@@ -54,22 +45,64 @@ Don't try to run `bot/main.py` yet - it doesn't exist in this drop.
 
 ## Running
 
-Not available yet in this drop - `bot/main.py` (the actual bot
-entrypoint) hasn't been built. Once it exists, running it will look
-like:
-
 ```
 python -m bot.main
 ```
 
+## Deploying to Render.com
+
+This repo includes a `render.yaml` blueprint, so Render can configure
+most of this automatically:
+
+1. Push this repo to GitHub (see the note in `.gitignore` below first -
+   your real `.env` never gets committed, which is exactly what you want).
+2. In the Render dashboard: **New -> Blueprint**, pick this GitHub repo.
+   Render reads `render.yaml` and proposes the service - review and
+   click **Apply**.
+3. When prompted, paste your real `TELEGRAM_BOT_TOKEN` (and
+   `ALPHA_VANTAGE_API_KEY` if you have one) - these are entered directly
+   in Render's dashboard as environment variables, never through the repo.
+4. Deploy. Render runs `pip install -r requirements.txt` then
+   `python -m bot.main`.
+
+**Two things to understand before relying on this in production**
+(also documented inline in `render.yaml`):
+
+- **Free tier sleeps.** Render's free Web Services spin down after
+  ~15 minutes with no inbound HTTP traffic, and nothing ever calls this
+  bot's health-check endpoint on its own - so a free instance *will*
+  go to sleep and stop polling Telegram, breaking the "24/7" part
+  entirely. For genuine always-on behaviour, either:
+  - Upgrade to Render's **Starter** plan (`plan: starter` in
+    `render.yaml`) - stays running continuously, no sleep, and unlocks
+    persistent disks (see below); or
+  - Stay on free and use an external uptime pinger (e.g.
+    [UptimeRobot](https://uptimerobot.com)) to hit your Render URL
+    every ~10 minutes. This works but isn't bulletproof (cold starts
+    add a delay, and Render's free plan has a shared monthly hour cap
+    across all your free services).
+
+- **SQLite state resets on the free tier.** `database/bot_state.db`
+  (who has which mode ON) lives on local disk. Render's filesystem is
+  ephemeral on the free plan - every restart/redeploy wipes it, so
+  users would need to re-toggle their modes afterward. This doesn't
+  break anything, it just means state isn't remembered across
+  restarts. If you're on the paid Starter plan, uncomment the `disk:`
+  block in `render.yaml` to attach a persistent disk and this stops
+  being a concern.
+
 ## Project layout
 
-See the file plan this project follows for the full target structure
-(`bot/`, `engine/`, `jobs/`, `database/`, `tests/`). `engine/` carries
-over the existing analysis code (indicators, trading concepts, signal
-scanner, Bitget adapter, order flow, news) from the web dashboard
-project largely as-is; `bot/`, `jobs/`, and `database/` are
-Telegram-bot-specific and built fresh.
+`bot/` - the Telegram-facing layer: keyboards, per-button handlers,
+message formatting, and per-chat mode state (`state_store.py`,
+backed by SQLite). `jobs/` - the two 24/7 background watchers
+(`volume_spike_watcher.py`, `strong_signal_watcher.py`), each scheduled
+per-chat via `python-telegram-bot`'s job queue when a user turns a mode
+on. `engine/` - the analysis engine (indicators, trading concepts,
+signal scanner, Bitget adapter, order flow, news), carried over from
+the original web dashboard project. `database/` - the SQLite state
+file plus the shipped default indicator on/off toggles. `tests/` -
+sanity tests for the indicator engine.
 
 ## Notes
 

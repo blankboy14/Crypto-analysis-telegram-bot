@@ -47,6 +47,18 @@ volume_spike_watch:
   btc_symbol: "BTCUSDT"
   # Don't re-alert the same pair/direction again within this window.
   cooldown_seconds: 900
+  # --- volume burst add-on (real traded volume, not price) ---
+  # A pair's traded volume this interval must be at least this many
+  # times its own recent baseline to count as a "burst".
+  volume_burst_multiplier: 5.0
+  # Need at least this many prior interval samples before a baseline
+  # is trusted enough to compare against (avoids flagging on noise
+  # while a pair is still "warming up").
+  volume_burst_min_samples: 5
+  # If > 0, only alert bursts where the pair's baseline interval
+  # volume was at/below this (USDT) - i.e. it really was quiet before.
+  # 0 disables the filter and considers every pair regardless of size.
+  volume_burst_low_floor_usdt: 0
 
 # --- Phase 2.2: "Find Strong Signal" 24/7 scanner ---
 strong_signal_watch:
@@ -57,6 +69,25 @@ strong_signal_watch:
   worker_count: 8
   # Don't push the exact same pair+verdict again within this window.
   cooldown_seconds: 3600
+  # --- pump/reversal SELL-bias add-on ---
+  # How far back (in daily snapshots) to look when judging a
+  # "cumulative" pump - a single 24h ticker figure can't see a move
+  # that built up over several days.
+  pump_window_days: 5
+  # Trailing cumulative % gain that marks a pair as overextended and
+  # worth watching for a reversal (per the spec: 80-100%+ pumps).
+  pump_threshold_pct: 80.0
+  # How often to re-check flagged pairs for a reversal - cheap (token
+  # list + occasional order-flow calls only), so this can run much
+  # more often than a full scan.
+  pump_check_interval_seconds: 60
+  # % drop from the peak price (since being flagged) that counts as
+  # "starting to reverse".
+  reversal_drop_pct: 15.0
+  # Live order flow's sell-side % must be at/above this to CONFIRM a
+  # reversal once the price drop threshold is hit (if order flow is
+  # unavailable, the price drop alone is treated as sufficient).
+  reversal_sell_flow_pct: 55.0
 
 # --- Phase 2.3: "Search Signal" one-shot scan ---
 search_signal:

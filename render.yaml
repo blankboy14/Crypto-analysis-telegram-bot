@@ -1,0 +1,57 @@
+# render.yaml - Render.com Blueprint
+#
+# Lets Render auto-configure this service when you connect the GitHub
+# repo (Render dashboard -> New -> Blueprint -> pick this repo). If you
+# prefer to configure everything by hand in the dashboard instead, this
+# file is optional - just make sure the settings below match what you
+# enter manually.
+#
+# WHY "web" AND NOT "worker": this bot only does outbound long-polling
+# to Telegram - it doesn't need to receive any inbound HTTP traffic.
+# But Render's FREE tier only offers Web Services (Background Workers
+# need a paid plan), so bot/main.py starts a tiny do-nothing HTTP
+# server on $PORT purely to satisfy Render's "detected an open port"
+# health check. That's the entire reason this is type "web".
+#
+# TWO THINGS TO KNOW BEFORE DEPLOYING (this is what actually determines
+# whether "24/7" really means 24/7 - see the README's Deploying to
+# Render.com section for the full explanation):
+#
+# 1. Render's FREE web services SPIN DOWN after ~15 minutes with no
+#    inbound HTTP requests, and NOTHING ever calls this bot's health
+#    endpoint on its own - so a free instance will go to sleep and stop
+#    polling Telegram entirely. For genuine 24/7 behaviour you need
+#    either the paid Starter plan (stays running continuously - set
+#    `plan: starter` below), or an external uptime pinger (e.g.
+#    UptimeRobot) hitting this service's URL every ~10 minutes to keep
+#    a free instance awake (imperfect - still has a monthly free-hours
+#    cap shared across your free services).
+#
+# 2. `database/bot_state.db` (who has which mode ON) lives on local
+#    disk, which Render wipes on every deploy/restart UNLESS a
+#    persistent disk is attached (Starter plan or higher - see the
+#    commented `disk:` block below). On the free plan, every restart
+#    means users need to re-toggle their modes - the bot itself won't
+#    crash or misbehave, it just starts from a clean state.
+
+services:
+  - type: web
+    name: crypto-telegram-bot
+    runtime: python
+    plan: free  # change to "starter" for true always-on + the option to attach a persistent disk (see notes above)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m bot.main
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # you'll be prompted to paste this in the Render dashboard - never stored in the repo
+      - key: ALPHA_VANTAGE_API_KEY
+        sync: false  # optional - only enables one extra news source (engine/news_service.py); leave blank to skip it
+      - key: PYTHON_VERSION
+        value: "3.12.0"  # pin explicitly - avoids Render picking a Python version this project hasn't been tested against
+
+    # Uncomment if you're on a paid plan and want database/bot_state.db
+    # to survive restarts/redeploys instead of resetting to empty:
+    # disk:
+    #   name: bot-state
+    #   mountPath: /opt/render/project/src/database
+    #   sizeGB: 1
