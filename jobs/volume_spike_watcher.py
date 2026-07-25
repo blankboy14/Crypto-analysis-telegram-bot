@@ -30,12 +30,16 @@ state_store.get_active_chats_for_mode()).
 """
 import logging
 import time
+from datetime import datetime, timezone, timedelta
 
-from engine.bitget_api import get_token_list
+from engine.bitget_api import get_token_list, fetch_bitget_spot_candles, fetch_bitget_futures_candles
 from engine.order_flow import get_order_flow
 from engine.signal_scanner import MARKET_SCOPE_MAP
 from bot import state_store
-from bot.formatters import format_volume_spike_alert, format_volume_burst_alert
+from bot.formatters import (
+    format_volume_spike_alert, format_volume_burst_alert,
+    format_absolute_volume_alert, format_daily_mover_alert, format_tier_move_alert,
+)
 
 log = logging.getLogger("crypto-telegram-bot")
 
@@ -71,6 +75,34 @@ _volume_history: dict[tuple[str, str], list[tuple[float, float]]] = {}
 # new interval's delta gets compared against.
 _volume_deltas: dict[tuple[str, str], list[float]] = {}
 _VOLUME_DELTA_HISTORY_MAX = 20
+
+# --- absolute volume burst tracking (add-on #1 - fixed USDT bar, not relative) ---
+
+# (exchange, raw_symbol) -> [(timestamp, usdtVolume24h), ...], kept much
+# longer than _volume_history above since this needs a baseline up to
+# window_seconds (e.g. 30 minutes) old, not just one poll_interval old.
+_abs_volume_history: dict[tuple, list[tuple[float, float]]] = {}
+_ABS_VOLUME_HISTORY_MAX_AGE_SECONDS = 3600  # 1 hour of headroom regardless of configured window_seconds
+
+# --- daily reset big-mover tracking (add-on #2) ---
+
+# (exchange, raw_symbol) -> (period_id, price_at_reset). period_id is
+# whatever _daily_period_id() returns for the "trading day" a sample
+# belongs to - shared across chats, since the reset baseline is the
+# same for everyone watching the same market.
+_daily_baseline_price: dict[tuple, tuple[str, float]] = {}
+
+# (chat_id, exchange, raw_symbol) -> period_id already alerted for -
+# per-CHAT (unlike the baseline above) so every chat still gets told
+# once per trading day, same reasoning as _last_alert's cooldown split.
+_daily_mover_alerted: dict[tuple, str] = {}
+
+# --- volatility-tier tracking (add-on #3 - BTC/ETH/SOL etc, candle-confirmed) ---
+
+# (exchange, raw_symbol, candle_interval) -> (fetched_at, [candle, ...]).
+# Candle fetches are heavier than a ticker snapshot, so these are only
+# refreshed every refresh_seconds regardless of how often tick() runs.
+_tier_candle_cache: dict[tuple, tuple[float, list]] = {}
 
 
 def _trim_volume_history(key: tuple, now: float) -> None:
@@ -248,6 +280,251 @@ def _detect_moves(scopes: list, cfg: dict) -> list:
     return events
 
 
+def _trim(samples: list, now: float, max_age: float) -> None:
+    """Generic version of _trim_history/_trim_volume_history for any (timestamp, value) list."""
+    if not samples:
+        return
+    cutoff = now - max_age
+    i = 0
+    while i < len(samples) and samples[i][0] < cutoff:
+        i += 1
+    if i:
+        del samples[:i]
+
+
+def _find_closest_with_ts(history: list, now: float, target_age: float):
+    """
+    Same "closest sample to target_age" idea as _find_baseline()/
+    _find_volume_baseline(), but also returns the sample's OWN
+    timestamp (not just its value) - callers here need the real
+    elapsed time, since a tick isn't guaranteed to land exactly
+    target_age seconds after the baseline.
+    """
+    if not history:
+        return None
+    candidates = [(abs((now - ts) - target_age), ts, val) for ts, val in history if now - ts >= target_age * 0.5]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    _, ts, val = candidates[0]
+    return ts, val
+
+
+def _detect_absolute_volume_bursts(scopes: list, cfg: dict) -> list:
+    """
+    24/7 Market Analyse add-on #1. Unlike _detect_volume_bursts() above
+    (which flags a pair moving far past ITS OWN recent baseline), this
+    flags a pair the moment its traded volume crosses a fixed absolute
+    USDT amount within a rolling window - e.g. a pair that normally
+    does ~100k/interval suddenly trading 60M+ within 30 minutes gets
+    caught here even on its very first sample, with no "warm-up"
+    baseline needed for the pair itself.
+    """
+    if not cfg.get("enabled", True):
+        return []
+
+    now = time.time()
+    window_seconds = cfg.get("window_seconds", 1800)
+    abs_threshold = cfg.get("absolute_threshold_usdt", 60_000_000)
+
+    events = []
+    for scope in scopes:
+        try:
+            tokens = get_token_list(scope)["tokens"]
+        except Exception as exc:
+            log.error(f"Absolute volume watch: token list fetch failed for {scope}: {exc}")
+            continue
+
+        for token in tokens:
+            raw_symbol = token["rawSymbol"]
+            vol24h = token.get("usdtVolume24h")
+            if not vol24h:
+                continue
+
+            key = (scope, raw_symbol)
+            history = _abs_volume_history.setdefault(key, [])
+            baseline = _find_closest_with_ts(history, now, window_seconds)
+            history.append((now, vol24h))
+            _trim(history, now, _ABS_VOLUME_HISTORY_MAX_AGE_SECONDS)
+
+            if baseline is None:
+                continue  # still warming up - not enough history for this pair yet
+
+            baseline_ts, baseline_vol = baseline
+            actual_window = now - baseline_ts
+            if actual_window <= 0:
+                continue
+
+            interval_volume = vol24h - baseline_vol
+            if interval_volume <= 0:
+                continue
+
+            # Scale the threshold to the ACTUAL elapsed comparison
+            # window rather than the configured one - this is what
+            # keeps "X+ within Y minutes" correct even if a tick lands
+            # late/irregular or window_seconds itself gets edited.
+            scaled_threshold = abs_threshold * (actual_window / window_seconds)
+
+            if interval_volume >= scaled_threshold:
+                events.append({
+                    "exchange": scope, "rawSymbol": raw_symbol, "symbol": token["symbol"],
+                    "lastPrice": token.get("lastPrice"), "intervalVolume": interval_volume,
+                    "windowSeconds": actual_window, "thresholdUsdt": scaled_threshold,
+                })
+
+    return events
+
+
+def _daily_period_id(now_ts: float, reset_hour_utc: int) -> str:
+    """
+    Which "trading day" `now_ts` falls into, given a daily reset hour
+    (e.g. reset_hour_utc=0 means the trading day rolls over at 00:00
+    UTC = 06:00 in Bangladesh). Shifting the clock back by the reset
+    hour before taking the date is what makes the boundary land at the
+    right moment instead of always at UTC midnight.
+    """
+    shifted = datetime.fromtimestamp(now_ts, tz=timezone.utc) - timedelta(hours=reset_hour_utc)
+    return shifted.date().isoformat()
+
+
+def _detect_daily_movers(scopes: list, cfg: dict) -> list:
+    """
+    24/7 Market Analyse add-on #2. Once a day, at reset_hour_utc, each
+    pair's price becomes that day's baseline; if a pair ever ends up
+    up_threshold_pct+ above (or down_threshold_pct+ below) ITS OWN
+    day-start price before the next reset, it's flagged - independent
+    of the exchange's rolling 24h% field, which slides forward
+    continuously and never lines up with any fixed clock time. Both
+    directions are checked every tick - a pair only needs to clear its
+    OWN direction's bar, not both.
+    """
+    if not cfg.get("enabled", True):
+        return []
+
+    now = time.time()
+    reset_hour = cfg.get("reset_hour_utc", 0)
+    up_threshold = cfg.get("up_threshold_pct", 60.0)
+    down_threshold = cfg.get("down_threshold_pct", 40.0)
+    period_id = _daily_period_id(now, reset_hour)
+
+    events = []
+    for scope in scopes:
+        try:
+            tokens = get_token_list(scope)["tokens"]
+        except Exception as exc:
+            log.error(f"Daily mover watch: token list fetch failed for {scope}: {exc}")
+            continue
+
+        for token in tokens:
+            raw_symbol = token["rawSymbol"]
+            price = token.get("lastPrice")
+            if not price:
+                continue
+
+            key = (scope, raw_symbol)
+            stored = _daily_baseline_price.get(key)
+            if stored is None or stored[0] != period_id:
+                # First time seen, or a new trading day just started -
+                # today's baseline is whatever price it is right now.
+                _daily_baseline_price[key] = (period_id, price)
+                continue
+
+            _, baseline_price = stored
+            if baseline_price <= 0:
+                continue
+
+            pct_change = (price - baseline_price) / baseline_price * 100
+            threshold = up_threshold if pct_change > 0 else down_threshold
+            if abs(pct_change) >= threshold:
+                events.append({
+                    "exchange": scope, "rawSymbol": raw_symbol, "symbol": token["symbol"],
+                    "lastPrice": price, "pctChange": pct_change,
+                    "direction": "up" if pct_change > 0 else "down", "periodId": period_id,
+                })
+
+    return events
+
+
+def _get_tier_candles(scope: str, raw_symbol: str, candle_interval: str, refresh_seconds: float):
+    """Cached last-2-candles fetch, refreshed at most every refresh_seconds per (scope, symbol, interval)."""
+    now = time.time()
+    key = (scope, raw_symbol, candle_interval)
+    cached = _tier_candle_cache.get(key)
+    if cached and now - cached[0] < refresh_seconds:
+        return cached[1]
+
+    try:
+        if scope == "bitget-futures":
+            candles = fetch_bitget_futures_candles(raw_symbol, candle_interval, limit=2)
+        else:
+            candles = fetch_bitget_spot_candles(raw_symbol, candle_interval, limit=2)
+    except Exception as exc:
+        log.error(f"Volatility tier watch: candle fetch failed for {raw_symbol} ({scope}): {exc}")
+        candles = None
+
+    _tier_candle_cache[key] = (now, candles)
+    return candles
+
+
+def _detect_tier_moves(scopes: list, cfg: dict) -> list:
+    """
+    24/7 Market Analyse add-on #3. Pairs like BTC/ETH/SOL rarely move
+    more than a couple % a day, so the general spike_pct_threshold
+    (20%+) would basically never fire for them - a much smaller move on
+    its own candle timeframe already matters for these, PROVIDED it's
+    backed by real candle volume (so a thin-liquidity wick doesn't
+    trigger a false alarm).
+    """
+    if not cfg.get("enabled", True):
+        return []
+
+    refresh_seconds = cfg.get("refresh_seconds", 60)
+    tiers = cfg.get("tiers", [])
+
+    events = []
+    for tier in tiers:
+        symbols = [s.upper() for s in tier.get("symbols", [])]
+        pct_threshold = tier.get("pct_threshold", 3.0)
+        candle_interval = tier.get("candle_interval", "30m")
+        min_volume_usdt = tier.get("min_candle_volume_usdt", 0)
+
+        for scope in scopes:
+            try:
+                tokens = get_token_list(scope)["tokens"]
+            except Exception as exc:
+                log.error(f"Volatility tier watch: token list fetch failed for {scope}: {exc}")
+                continue
+
+            for token in tokens:
+                raw_symbol = token["rawSymbol"]
+                if raw_symbol.upper() not in symbols:
+                    continue
+
+                candles = _get_tier_candles(scope, raw_symbol, candle_interval, refresh_seconds)
+                if not candles:
+                    continue
+
+                latest = candles[-1]
+                open_price = latest.get("open")
+                close_price = latest.get("close")
+                candle_volume = latest.get("volume")
+                if not open_price or not close_price or candle_volume is None:
+                    continue
+
+                pct_change = (close_price - open_price) / open_price * 100
+                candle_volume_usdt = candle_volume * close_price
+
+                if abs(pct_change) >= pct_threshold and candle_volume_usdt >= min_volume_usdt:
+                    events.append({
+                        "exchange": scope, "rawSymbol": raw_symbol, "symbol": token["symbol"],
+                        "lastPrice": token.get("lastPrice"), "pctChange": pct_change,
+                        "candleInterval": candle_interval, "candleVolumeUsdt": candle_volume_usdt,
+                        "direction": "up" if pct_change > 0 else "down",
+                    })
+
+    return events
+
+
 async def tick(context) -> None:
     """The job_queue.run_repeating callback - one poll for one chat."""
     job = context.job
@@ -302,11 +579,16 @@ async def tick(context) -> None:
             log.error(f"Volume spike watch: failed to send alert to chat {chat_id}: {exc}")
 
     # --- volume burst check (real traded volume, independent of price) ---
-    try:
-        volume_events = _detect_volume_bursts(scopes, cfg)
-    except Exception as exc:
-        log.error(f"Volume burst watch: tick failed for chat {chat_id}: {exc}")
-        return
+    # Off by default - see volume_burst_enabled comment in settings.yaml
+    # for why (superseded by the absolute_volume_watch check further
+    # below, which needs a real dollar amount rather than just a
+    # multiplier over a possibly-tiny baseline).
+    volume_events = []
+    if cfg.get("volume_burst_enabled", False):
+        try:
+            volume_events = _detect_volume_bursts(scopes, cfg)
+        except Exception as exc:
+            log.error(f"Volume burst watch: tick failed for chat {chat_id}: {exc}")
 
     for event in volume_events:
         cooldown_key = (chat_id, event["rawSymbol"], "volume")
@@ -338,3 +620,90 @@ async def tick(context) -> None:
             )
         except Exception as exc:
             log.error(f"Volume burst watch: failed to send alert to chat {chat_id}: {exc}")
+
+    # --- absolute volume burst check (add-on #1: fixed USDT bar) ---
+    abs_cfg = settings.get("absolute_volume_watch", {})
+    abs_cooldown = abs_cfg.get("cooldown_seconds", 1800)
+    try:
+        abs_events = _detect_absolute_volume_bursts(scopes, abs_cfg)
+    except Exception as exc:
+        log.error(f"Absolute volume watch: tick failed for chat {chat_id}: {exc}")
+        abs_events = []
+
+    for event in abs_events:
+        cooldown_key = (chat_id, event["rawSymbol"], "abs_volume")
+        last = _last_alert.get(cooldown_key, 0)
+        if now - last < abs_cooldown:
+            continue
+
+        try:
+            text = format_absolute_volume_alert(
+                pair=event["symbol"], last_price=event["lastPrice"],
+                interval_volume=event["intervalVolume"], window_seconds=event["windowSeconds"],
+                threshold_usdt=event["thresholdUsdt"], market=market,
+            )
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            _last_alert[cooldown_key] = now
+            state_store.log_alert(
+                chat_id, event["exchange"], event["rawSymbol"], event["symbol"],
+                "abs_volume", event["intervalVolume"], event["lastPrice"],
+            )
+        except Exception as exc:
+            log.error(f"Absolute volume watch: failed to send alert to chat {chat_id}: {exc}")
+
+    # --- daily reset big-mover check (add-on #2) ---
+    daily_cfg = settings.get("daily_mover_watch", {})
+    try:
+        daily_events = _detect_daily_movers(scopes, daily_cfg)
+    except Exception as exc:
+        log.error(f"Daily mover watch: tick failed for chat {chat_id}: {exc}")
+        daily_events = []
+
+    for event in daily_events:
+        dedupe_key = (chat_id, event["exchange"], event["rawSymbol"])
+        if _daily_mover_alerted.get(dedupe_key) == event["periodId"]:
+            continue  # already told this chat about this pair for today's trading day
+
+        try:
+            text = format_daily_mover_alert(
+                pair=event["symbol"], last_price=event["lastPrice"],
+                pct_change=event["pctChange"], market=market,
+            )
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            _daily_mover_alerted[dedupe_key] = event["periodId"]
+            state_store.log_alert(
+                chat_id, event["exchange"], event["rawSymbol"], event["symbol"],
+                event["direction"], event["pctChange"], event["lastPrice"],
+            )
+        except Exception as exc:
+            log.error(f"Daily mover watch: failed to send alert to chat {chat_id}: {exc}")
+
+    # --- volatility-tier check (add-on #3: BTC/ETH/SOL etc, candle-confirmed) ---
+    tier_cfg = settings.get("volatility_tier_watch", {})
+    tier_cooldown = tier_cfg.get("cooldown_seconds", 1800)
+    try:
+        tier_events = _detect_tier_moves(scopes, tier_cfg)
+    except Exception as exc:
+        log.error(f"Volatility tier watch: tick failed for chat {chat_id}: {exc}")
+        tier_events = []
+
+    for event in tier_events:
+        cooldown_key = (chat_id, event["rawSymbol"], f"tier_{event['direction']}")
+        last = _last_alert.get(cooldown_key, 0)
+        if now - last < tier_cooldown:
+            continue
+
+        try:
+            text = format_tier_move_alert(
+                pair=event["symbol"], last_price=event["lastPrice"], pct_change=event["pctChange"],
+                candle_interval=event["candleInterval"], candle_volume_usdt=event["candleVolumeUsdt"],
+                market=market,
+            )
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            _last_alert[cooldown_key] = now
+            state_store.log_alert(
+                chat_id, event["exchange"], event["rawSymbol"], event["symbol"],
+                event["direction"], event["pctChange"], event["lastPrice"],
+            )
+        except Exception as exc:
+            log.error(f"Volatility tier watch: failed to send alert to chat {chat_id}: {exc}")

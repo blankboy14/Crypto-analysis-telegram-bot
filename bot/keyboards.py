@@ -28,8 +28,11 @@ BTN_STRONG_SIGNAL_ON = "🔥 Find 24/7 Strong Signal"
 BTN_STRONG_SIGNAL_OFF = "🛑 Off 24/7 Find Signal"
 BTN_STRONG_SIGNAL_STATUS = "📈 Find 24/7 Strong Signal — Status"
 BTN_SEARCH_SIGNAL = "🔎 Search Signal"
+BTN_SEARCH_SIGNAL_STATUS = "📈 Search Signal — Status"
+BTN_SIGNAL_OUTCOMES = "📊 Signal Outcomes"
 BTN_SINGLE_PAIR_ANALYSE = "🎯 Single Pair Analyse"
 BTN_MARKET_DETAILS = "📋 Market Details"
+BTN_WALLET_BALANCE = "💰 Wallet Balance"
 BTN_HELP = "ℹ️ Help"
 
 # Order here = order shown on the keyboard (top to bottom).
@@ -41,8 +44,11 @@ MAIN_MENU_BUTTONS = [
     BTN_STRONG_SIGNAL_OFF,
     BTN_STRONG_SIGNAL_STATUS,
     BTN_SEARCH_SIGNAL,
+    BTN_SEARCH_SIGNAL_STATUS,
+    BTN_SIGNAL_OUTCOMES,
     BTN_SINGLE_PAIR_ANALYSE,
     BTN_MARKET_DETAILS,
+    BTN_WALLET_BALANCE,
     BTN_HELP,
 ]
 

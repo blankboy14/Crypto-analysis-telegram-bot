@@ -125,6 +125,10 @@ async def handle_pair_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     enabled_concepts = None
     loop = asyncio.get_running_loop()
 
+    settings = context.bot_data.get("settings", {})
+    mm_cfg = settings.get("money_management", {})
+    wallet_bal = state_store.get_wallet_balance(chat_id)
+
     try:
         news_items = await loop.run_in_executor(SCAN_EXECUTOR, lambda: get_news_feed(limit=100))
     except Exception as exc:
@@ -139,6 +143,7 @@ async def handle_pair_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     token["rawSymbol"], token["symbol"], scope,
                     token.get("usdtVolume24h", 0), enabled_indicators, enabled_concepts, news_items,
                     change_24h=token.get("change24h"),
+                    funding_rate=token.get("fundingRate"), open_interest=token.get("openInterest"),
                 ),
             )
         except Exception as exc:
@@ -150,9 +155,18 @@ async def handle_pair_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             continue
 
-        await context.bot.send_message(chat_id=chat_id, text=format_single_pair_report(result), parse_mode="Markdown")
+        report_text = format_single_pair_report(result, wallet_bal, mm_cfg)
+        await context.bot.send_message(chat_id=chat_id, text=report_text, parse_mode="Markdown")
         if result.get("tradeable"):
             state_store.log_signal(
                 chat_id, "single_pair", scope, result.get("symbol", "?"),
                 result.get("verdict", "?"), result.get("multiTimeframe", {}).get("combinedConfidence", 0),
+                message_text=report_text,
             )
+            plan = result.get("tradePlan")
+            if plan:
+                state_store.record_signal_outcome_tracking(
+                    chat_id, "single_pair", scope, result.get("rawSymbol", ""),
+                    result.get("symbol", "?"), result.get("verdict", "?"),
+                    plan["entry"], plan["stopLoss"], plan.get("tp1"), plan.get("tp2"), plan.get("tp3"),
+                )

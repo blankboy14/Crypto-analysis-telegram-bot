@@ -33,6 +33,7 @@ from engine.trading_concepts.analysis import compute_all_concepts
 from engine.trading_concepts.support_resistance import analyze_support_resistance
 from engine.indicators.atr import compute_atr
 from engine.signal_engine import compute_overall_signal, WEIGHTS, INDICATOR_VOTE_KEYS, CONCEPT_VOTE_KEYS
+from engine.futures_metrics import fold_in_funding_rate, fold_in_open_interest
 
 log = logging.getLogger("crypto-analyzer-http")
 
@@ -68,6 +69,16 @@ SELL_THRESHOLD = -20
 
 ATR_SL_BUFFER_MULT = 0.5   # stop sits this many ATRs beyond the nearest support/resistance, not exactly on it
 ATR_EXTRAPOLATED_TARGET_MULT = 1.5  # when fewer than 3 real S/R levels exist, extrapolate further targets by this many ATRs
+# A real support/resistance cluster only counts as a usable target if
+# it's at least this many multiples of the trade's OWN risk (entry to
+# stop) away. Without this, the nearest cluster can sit almost right
+# next to entry while the stop (built from the OPPOSITE side's
+# structure) sits much farther out - a real trade plan, but one whose
+# very first target risks far more than it can win. Structure that's
+# too close to be a worthwhile target just isn't used as one; it's
+# skipped in favor of the next qualifying level or an ATR-extrapolated
+# one, same as when there simply aren't 3 real levels at all.
+MIN_TARGET_RISK_REWARD = 1.0
 
 
 def compute_structure_trade_plan(candles, direction):
@@ -77,7 +88,9 @@ def compute_structure_trade_plan(candles, direction):
     explicit request that this should read like a human-made plan, not
     a mechanical 1:2/1:3 formula. The resulting risk:reward numbers are
     whatever the actual structure produces (sometimes 1:1.4, sometimes
-    1:5) - that variability is intentional, not a bug.
+    1:5) - that variability is intentional, not a bug. What ISN'T
+    intentional is a target closer to entry than the risk being taken
+    to reach it - see MIN_TARGET_RISK_REWARD above.
 
     Returns None if there isn't enough structure to build a plan from
     yet (too little swing history) - callers should treat that pair as
@@ -93,28 +106,41 @@ def compute_structure_trade_plan(candles, direction):
 
     supports = sr["support"]
     resistances = sr["resistance"]
+    entry = current_price
 
     if direction == "BUY":
         stop_loss = supports[0]["price"] - atr * ATR_SL_BUFFER_MULT
         liquidity_zone = supports[0]["price"]
-        targets = [r["price"] for r in resistances[:3]]
-        while len(targets) < 3:
-            base = targets[-1] if targets else current_price
-            targets.append(base + atr * ATR_EXTRAPOLATED_TARGET_MULT)
     elif direction == "SELL":
         stop_loss = resistances[0]["price"] + atr * ATR_SL_BUFFER_MULT
         liquidity_zone = resistances[0]["price"]
-        targets = [s["price"] for s in supports[:3]]
-        while len(targets) < 3:
-            base = targets[-1] if targets else current_price
-            targets.append(base - atr * ATR_EXTRAPOLATED_TARGET_MULT)
     else:
         return None
 
-    entry = current_price
     risk = abs(entry - stop_loss)
     if risk <= 0:
         return None
+    min_target_distance = risk * MIN_TARGET_RISK_REWARD
+
+    if direction == "BUY":
+        targets = [r["price"] for r in resistances if r["price"] - entry >= min_target_distance][:3]
+        while len(targets) < 3:
+            base = targets[-1] if targets else entry
+            next_target = base + atr * ATR_EXTRAPOLATED_TARGET_MULT
+            if not targets and next_target - entry < min_target_distance:
+                # first fallback target with nothing real to build on yet -
+                # guarantee it still clears the minimum bar rather than
+                # inheriting whatever the ATR step happens to produce
+                next_target = entry + min_target_distance
+            targets.append(next_target)
+    else:
+        targets = [s["price"] for s in supports if entry - s["price"] >= min_target_distance][:3]
+        while len(targets) < 3:
+            base = targets[-1] if targets else entry
+            next_target = base - atr * ATR_EXTRAPOLATED_TARGET_MULT
+            if not targets and entry - next_target < min_target_distance:
+                next_target = entry - min_target_distance
+            targets.append(next_target)
 
     return {
         "entry": round(entry, 8),
@@ -142,12 +168,34 @@ def analyze_pair_multi_timeframe(raw_symbol, exchange, enabled_indicators, enabl
     adapter = EXCHANGE_ADAPTERS[exchange]
     per_tf = {}
     candles_by_tf = {}
+    fetch_failures = 0
+    too_short_count = 0
 
     for tf in SCAN_TIMEFRAMES:
         if tf not in adapter["granularities"]:
             continue
-        candles = adapter["fetch"](raw_symbol, tf, CANDLE_LIMIT_PER_TIMEFRAME)
+        candles = None
+        fetch_failed = False
+        for attempt in range(2):  # one retry - a full scan runs worker_count pairs concurrently,
+            # each pulling up to 6 timeframes, which can easily burst past Bitget's
+            # rate limit; most failures here are a transient 429, not a real outage,
+            # and previously had zero retry - a single rate-limit blip permanently
+            # sacrificed that timeframe (and, across a whole scan, could plausibly
+            # do this to MOST pairs at once since the same burst hits everyone).
+            try:
+                candles = adapter["fetch"](raw_symbol, tf, CANDLE_LIMIT_PER_TIMEFRAME)
+                break
+            except Exception as exc:
+                if attempt == 0:
+                    time.sleep(0.75)
+                    continue
+                fetch_failed = True
+                log.warning(f"Multi-timeframe scan: {tf} candle fetch failed for {raw_symbol} ({exchange}) after retry, skipping this timeframe: {exc}")
+        if fetch_failed:
+            fetch_failures += 1
+            continue
         if not candles or len(candles) < 20:
+            too_short_count += 1
             continue
         indicators = compute_all_indicators(candles, enabled=enabled_indicators)
         concepts = compute_all_concepts(candles, enabled=enabled_concepts)
@@ -160,7 +208,19 @@ def analyze_pair_multi_timeframe(raw_symbol, exchange, enabled_indicators, enabl
         candles_by_tf[tf] = candles
 
     if len(per_tf) < MIN_TIMEFRAMES_WITH_DATA:
-        return None
+        # Distinguishing WHY there isn't enough data matters to whoever
+        # reads the result: fetch_failures pointing at most of the gap
+        # suggests a transient/rate-limit problem worth a retry later;
+        # too_short_count pointing at most of it means the pair itself
+        # (e.g. a very recently listed one) genuinely doesn't have
+        # enough candle history yet - no amount of retrying fixes that.
+        return {
+            "insufficientData": True,
+            "timeframesAnalyzed": len(per_tf),
+            "fetchFailures": fetch_failures,
+            "tooShortCount": too_short_count,
+        }
+
 
     total_weight = sum(TIMEFRAME_WEIGHTS[tf] for tf in per_tf)
     combined_score = sum(TIMEFRAME_WEIGHTS[tf] * per_tf[tf]["score"] for tf in per_tf) / total_weight
@@ -272,11 +332,13 @@ def build_explanation(mtf_result, order_flow_folded_in, news_item, verdict):
 def summarize_votes(votes):
     """
     Splits a timeframe's raw vote list (signal["votes"]) into short,
-    human-readable "indicator info" / "concept info" one-liners for the
-    bot's Search Signal full-analysis mode - e.g.
-    "RSI 28.4 (oversold) bullish, MACD histogram +0.0012 bullish".
-    Returns (indicator_text, concept_text); either is "No clear signal"
-    if that family had no opinion on this timeframe.
+    human-readable "indicator info" / "concept info" one-liners (for
+    older/simpler callers) AND the underlying vote lists themselves
+    (for callers that want to render each one as its own bullet point -
+    the joined strings aren't safely re-splittable since a single
+    note's own text can itself contain a comma, e.g. "ADX 31.8, -DI >
+    +DI (trending down)").
+    Returns (indicator_text, concept_text, indicator_votes, concept_votes).
     """
     def _fmt(vs):
         if not vs:
@@ -285,22 +347,29 @@ def summarize_votes(votes):
 
     indicator_votes = [v for v in votes if v["key"] in INDICATOR_VOTE_KEYS]
     concept_votes = [v for v in votes if v["key"] in CONCEPT_VOTE_KEYS]
-    return _fmt(indicator_votes), _fmt(concept_votes)
+    return _fmt(indicator_votes), _fmt(concept_votes), indicator_votes, concept_votes
 
 
-def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enabled_indicators, enabled_concepts, news_items, change_24h=None):
+def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enabled_indicators, enabled_concepts, news_items,
+                      change_24h=None, funding_rate=None, open_interest=None):
     """
     Full per-pair pipeline: liquidity gate -> multi-timeframe signal ->
-    order flow -> news -> tradeable decision -> (if tradeable)
-    structure-based trade plan. Always returns a result dict (never
-    raises) so one pair's failure can't take down the whole scan -
-    failures are recorded in the result instead.
+    order flow -> funding rate/open interest (futures only) -> news ->
+    tradeable decision -> (if tradeable) structure-based trade plan.
+    Always returns a result dict (never raises) so one pair's failure
+    can't take down the whole scan - failures are recorded in the
+    result instead.
+
+    `funding_rate`/`open_interest` come straight from the futures
+    ticker (see engine.bitget_api.fetch_bitget_futures_tickers) -
+    always None for spot pairs, which have neither concept.
     """
     result = {
         "symbol": display_symbol, "rawSymbol": raw_symbol, "exchange": exchange,
         "usdtVolume24h": usdt_volume_24h, "change24h": change_24h,
         "tradeable": False, "reason": None,
         "indicatorInfo": "Not enough data", "conceptInfo": "Not enough data",
+        "indicatorVotes": [], "conceptVotes": [],
     }
 
     if usdt_volume_24h < MIN_USDT_VOLUME_24H:
@@ -314,13 +383,27 @@ def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enab
         result["reason"] = "Analysis failed"
         return result
 
-    if mtf is None:
-        result["reason"] = "Not enough candle history on enough timeframes yet"
+    if mtf is None or mtf.get("insufficientData"):
+        analyzed = mtf.get("timeframesAnalyzed", 0) if mtf else 0
+        fetch_failures = mtf.get("fetchFailures", 0) if mtf else 0
+        too_short = mtf.get("tooShortCount", 0) if mtf else 0
+        if fetch_failures > too_short:
+            result["reason"] = (
+                f"Only {analyzed}/6 timeframes came back ({fetch_failures} fetch failures even after retry - "
+                f"likely a rate-limit/network blip, try again shortly)"
+            )
+        else:
+            result["reason"] = (
+                f"Only {analyzed}/6 timeframes have enough candle history yet "
+                f"({too_short} too short - likely a recently-listed pair, not a bug)"
+            )
         return result
 
     primary_tf = mtf.get("primaryTimeframe")
     primary_votes = mtf["perTimeframe"].get(primary_tf, {}).get("votes", []) if primary_tf else []
-    result["indicatorInfo"], result["conceptInfo"] = summarize_votes(primary_votes)
+    result["indicatorInfo"], result["conceptInfo"], result["indicatorVotes"], result["conceptVotes"] = (
+        summarize_votes(primary_votes)
+    )
 
     order_flow_live = None
     try:
@@ -331,6 +414,12 @@ def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enab
         log.error(f"Signal scan: order flow failed for {raw_symbol}: {exc}")
 
     score, confidence, flow_folded_in = fold_in_order_flow(mtf["combinedScore"], mtf["combinedConfidence"], order_flow_live)
+
+    last_close = mtf["primaryCandles"][-1]["close"] if mtf.get("primaryCandles") else None
+    score, confidence, funding_folded_in, funding_info = fold_in_funding_rate(score, confidence, funding_rate)
+    score, confidence, oi_folded_in, oi_info = fold_in_open_interest(
+        score, confidence, raw_symbol, exchange, open_interest, last_close,
+    )
 
     base_asset = guess_base_asset(raw_symbol)
     news_item = check_news_relevance(base_asset, news_items)
@@ -348,12 +437,15 @@ def analyze_one_pair(raw_symbol, display_symbol, exchange, usdt_volume_24h, enab
         "perTimeframe": mtf["perTimeframe"], "combinedScore": score, "combinedConfidence": confidence,
         "agreementCount": mtf["agreementCount"], "timeframesAnalyzed": mtf["timeframesAnalyzed"],
         "primaryTimeframe": mtf["primaryTimeframe"], "orderFlowFoldedIn": flow_folded_in,
+        "fundingRateFoldedIn": funding_folded_in, "openInterestFoldedIn": oi_folded_in,
     }
     result["orderFlow"] = order_flow_live
     if order_flow_live and order_flow_live.get("buyPct") is not None:
         result["orderFlowInfo"] = f"{order_flow_live['buyPct']:.1f}% buy-side tape"
     else:
         result["orderFlowInfo"] = "No live tape data"
+    result["fundingRateInfo"] = funding_info
+    result["openInterestInfo"] = oi_info
     result["newsImpact"] = news_item
 
     if mtf["agreementCount"] < MIN_TIMEFRAME_AGREEMENT:
@@ -435,14 +527,43 @@ def run_full_scan(job, scope, enabled_indicators, enabled_concepts, worker_count
             token["rawSymbol"], token["symbol"], scope,
             token.get("usdtVolume24h", 0), enabled_indicators, enabled_concepts, news_items,
             change_24h=token.get("change24h"),
+            funding_rate=token.get("fundingRate"), open_interest=token.get("openInterest"),
         )
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        futures = {pool.submit(work, t): t for t in tokens}
+        # futures keyed by each token's original rank (highest 24h% first)
+        # so completions can be re-sequenced below regardless of which
+        # worker's HTTP call happens to come back first.
+        futures = {pool.submit(work, t): idx for idx, t in enumerate(tokens)}
+
+        # as_completed() yields whichever of the worker_count in-flight
+        # requests finishes first - with several workers running at once
+        # that is NOT the same as `tokens` order. on_pair (the bot's
+        # "Full Analysis" stream, numbered #1, #2, #3...) needs the
+        # original order or the numbering scrambles, so finished results
+        # are parked here by their index and only handed to on_pair once
+        # every earlier-ranked pair has already been delivered.
+        pending_for_on_pair = {}
+        next_index_to_deliver = 0
+
+        def _flush_ready_for_on_pair():
+            nonlocal next_index_to_deliver
+            while next_index_to_deliver in pending_for_on_pair:
+                ready_result = pending_for_on_pair.pop(next_index_to_deliver)
+                next_index_to_deliver += 1
+                if ready_result is None:
+                    continue
+                if on_pair is not None:
+                    try:
+                        on_pair(ready_result)
+                    except Exception as exc:
+                        log.error(f"Signal scan: on_pair callback failed for {ready_result.get('rawSymbol')}: {exc}")
+
         for future in as_completed(futures):
             if job["cancelled"]:
                 break
-            token = futures[future]
+            idx = futures[future]
+            token = tokens[idx]
             try:
                 result = future.result()
             except Exception as exc:
@@ -451,21 +572,18 @@ def run_full_scan(job, scope, enabled_indicators, enabled_concepts, worker_count
                     "symbol": token["symbol"], "rawSymbol": token["rawSymbol"], "exchange": scope,
                     "tradeable": False, "reason": "Unexpected error during analysis",
                 }
-            if result is None:
-                continue
-            job["results"][result["rawSymbol"]] = result
-            job["completed"] += 1
 
-            if on_pair is not None:
-                try:
-                    on_pair(result)
-                except Exception as exc:
-                    log.error(f"Signal scan: on_pair callback failed for {result.get('rawSymbol')}: {exc}")
-            if on_progress is not None:
-                try:
-                    on_progress(job["completed"], job["total"])
-                except Exception as exc:
-                    log.error(f"Signal scan: on_progress callback failed: {exc}")
+            if result is not None:
+                job["results"][result["rawSymbol"]] = result
+                job["completed"] += 1
+                if on_progress is not None:
+                    try:
+                        on_progress(job["completed"], job["total"])
+                    except Exception as exc:
+                        log.error(f"Signal scan: on_progress callback failed: {exc}")
+
+            pending_for_on_pair[idx] = result
+            _flush_ready_for_on_pair()
 
     tradeable = [r for r in job["results"].values() if r.get("tradeable")]
     tradeable.sort(key=lambda r: r.get("rankScore", 0), reverse=True)

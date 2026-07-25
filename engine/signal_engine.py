@@ -29,6 +29,8 @@
 # CCI/MFI are supporting/confirming signals, not primary drivers.
 WEIGHTS = {
     "orderFlow": 1.3,
+    "fundingRate": 0.8,
+    "openInterest": 0.7,
     "superTrend": 1.5,
     "trendStructure": 1.3,
     "changeOfCharacter": 1.1,

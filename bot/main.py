@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime
 
 # Make sure the project root (parent of this 'bot' folder) is on sys.path.
 # This lets the file work whether it's launched as `python -m bot.main`
@@ -59,10 +60,13 @@ from bot.keyboards import (
     BTN_MARKET_ANALYSE_STATUS,
     BTN_MARKET_DETAILS,
     BTN_SEARCH_SIGNAL,
+    BTN_SEARCH_SIGNAL_STATUS,
+    BTN_SIGNAL_OUTCOMES,
     BTN_SINGLE_PAIR_ANALYSE,
     BTN_STRONG_SIGNAL_OFF,
     BTN_STRONG_SIGNAL_ON,
     BTN_STRONG_SIGNAL_STATUS,
+    BTN_WALLET_BALANCE,
 )
 from bot.handlers import (
     help as help_handler,
@@ -74,7 +78,10 @@ from bot.handlers import (
     start,
     status,
     strong_signal,
+    wallet_balance,
 )
+from jobs import heartbeat, keepalive, signal_outcome_tracker
+from web.dashboard import start_dashboard_server
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS_PATH = os.path.join(ROOT_DIR, "config", "settings.yaml")
@@ -117,8 +124,14 @@ def configure_logging(settings: dict) -> None:
 
     handlers = [logging.StreamHandler(sys.stdout)]
     if log_cfg.get("log_to_file"):
-        log_path = os.path.join(ROOT_DIR, log_cfg.get("log_file_path", "logs/bot_log.txt"))
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        # One fresh log file per run (instead of always appending to the
+        # same bot_log.txt), named with this run's start timestamp so
+        # every run's logs are kept separately.
+        configured_path = log_cfg.get("log_file_path", "logs/bot_log.txt")
+        log_dir = os.path.join(ROOT_DIR, os.path.dirname(configured_path) or "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        run_timestamp = datetime.now().strftime("%d_%m_%Y-%S_%M_%H")
+        log_path = os.path.join(log_dir, f"{run_timestamp}.txt")
         handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
 
     redact_filter = _RedactBotTokenFilter()
@@ -199,22 +212,27 @@ def register_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.Text([BTN_STRONG_SIGNAL_OFF]), strong_signal.handle_off))
     application.add_handler(MessageHandler(filters.Text([BTN_STRONG_SIGNAL_STATUS]), status.handle_strong_signal_status))
     application.add_handler(MessageHandler(filters.Text([BTN_SEARCH_SIGNAL]), search_signal.handle))
+    application.add_handler(MessageHandler(filters.Text([BTN_SEARCH_SIGNAL_STATUS]), status.handle_search_signal_status))
+    application.add_handler(MessageHandler(filters.Text([BTN_SIGNAL_OUTCOMES]), status.handle_signal_outcomes))
     application.add_handler(MessageHandler(filters.Text([BTN_SINGLE_PAIR_ANALYSE]), single_pair_analyse.handle))
     application.add_handler(MessageHandler(filters.Text([BTN_MARKET_DETAILS]), market_details.handle))
+    application.add_handler(MessageHandler(filters.Text([BTN_WALLET_BALANCE]), wallet_balance.handle))
     application.add_handler(MessageHandler(filters.Text([BTN_HELP]), help_handler.handle))
 
     # Catch-all for free-text typed after a button asks for it - a pair
-    # name (Single Pair Analyse) or a "how many pairs" number (Market
-    # Details). MUST be registered last (within this same group=0) -
-    # PTB only runs the FIRST matching handler in a group per update, so
-    # every exact-label button above still wins its own match first;
-    # this one only ever sees text that didn't match any of them. Each
-    # of the two handlers below is a no-op unless THIS chat is actually
-    # waiting for its own kind of input (see their own early-returns),
-    # so routing through both in sequence is safe.
+    # name (Single Pair Analyse), a "how many pairs" number (Market
+    # Details), or a wallet balance (Wallet Balance). MUST be
+    # registered last (within this same group=0) - PTB only runs the
+    # FIRST matching handler in a group per update, so every exact-label
+    # button above still wins its own match first; this one only ever
+    # sees text that didn't match any of them. Each of the handlers
+    # below is a no-op unless THIS chat is actually waiting for its own
+    # kind of input (see their own early-returns), so routing through
+    # all of them in sequence is safe.
     async def _text_router(update, context):
         await single_pair_analyse.handle_pair_text(update, context)
         await market_details.handle_number_text(update, context)
+        await wallet_balance.handle_balance_text(update, context)
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _text_router))
 
@@ -231,10 +249,42 @@ def build_application(settings: dict) -> Application:
     # job_queue is what the "24/7" watchers (Phase 2.1/2.2) run on:
     # market_analyse.handle_on / strong_signal.handle_on are expected to
     # call context.job_queue.run_repeating(...) per-chat when a user
-    # switches a mode ON, and cancel that job on OFF. Nothing is
-    # scheduled here directly - this just needs the queue to exist.
+    # switches a mode ON, and cancel that job on OFF - none of THOSE
+    # are scheduled here directly.
+    # signal_outcome_tracker is the one exception: it's GLOBAL, not
+    # per-chat (it just checks whatever's still open in signal_outcomes
+    # across every chat), so it's scheduled once, right here, and runs
+    # regardless of any chat's own 24/7 toggle state.
     application = Application.builder().token(token).rate_limiter(AIORateLimiter()).build()
     application.bot_data["settings"] = settings
+
+    outcome_cfg = settings.get("signal_outcome_tracker", {})
+    if outcome_cfg.get("enabled", True):
+        application.job_queue.run_repeating(
+            signal_outcome_tracker.tick,
+            interval=outcome_cfg.get("poll_interval_seconds", 300),
+            first=15,
+        )
+
+    # Anti-sleep heartbeat (see jobs/heartbeat.py) - HEARTBEAT_CHAT_ID
+    # lives in .env (not settings.yaml) since it's a personal chat id,
+    # not a tunable number safe to commit.
+    heartbeat_cfg = settings.setdefault("heartbeat", {})
+    env_heartbeat_chat_id = os.getenv("HEARTBEAT_CHAT_ID")
+    if env_heartbeat_chat_id:
+        try:
+            heartbeat_cfg["chat_id"] = int(env_heartbeat_chat_id)
+        except ValueError:
+            log.error("HEARTBEAT_CHAT_ID in .env is not a valid chat id - heartbeat disabled.")
+
+    if heartbeat_cfg.get("enabled", True) and heartbeat_cfg.get("chat_id"):
+        application.job_queue.run_repeating(
+            heartbeat.tick,
+            interval=heartbeat_cfg.get("interval_seconds", 3600),
+            first=60,
+        )
+    else:
+        log.info("Heartbeat not scheduled - set HEARTBEAT_CHAT_ID in .env to enable it.")
 
     register_handlers(application)
     return application
@@ -252,6 +302,9 @@ def _start_health_server() -> None:
             self.wfile.write(b"OK")
 
         def do_HEAD(self):
+            # Uptime monitors (e.g. UptimeRobot) send HEAD requests by
+            # default - without this, BaseHTTPRequestHandler has no
+            # do_HEAD and replies "501 Not Implemented".
             self.send_response(200)
             self.end_headers()
 
@@ -269,7 +322,23 @@ def main() -> None:
     settings = load_settings()
     configure_logging(settings)
 
-    _start_health_server()
+    # NOTE: _start_health_server() above is kept exactly as it was,
+    # untouched - but it's intentionally NOT called anymore. It opens
+    # the same $PORT that start_dashboard_server() below also opens,
+    # and only one server can bind to a given port at a time - calling
+    # both here would crash on startup with "address already in use".
+    # start_dashboard_server() does everything the old function did
+    # (opens $PORT, replies 200 to GET/HEAD so Render's free-tier port
+    # check passes) plus the new status page, so it's the one that
+    # actually runs. To go back to the old plain "OK" response, swap
+    # the line below to _start_health_server() instead.
+    start_dashboard_server()
+
+    # Self-ping keep-alive (jobs/keepalive.py) - pings PUBLIC_URL (set
+    # in .env) every KEEPALIVE_INTERVAL_MINUTES so Render's free tier
+    # never sees 15 minutes of inactivity and never spins the service
+    # down. No-ops with a log line if PUBLIC_URL isn't set.
+    keepalive.start()
 
     application = build_application(settings)
 

@@ -29,6 +29,16 @@ risk_management:
   stop_loss_pct_of_range: 0.30
   take_profit_pct_of_range: 0.60
   fallback_range_pct: 0.01
+  # --- stop-loss trailing (fixes "hit TP1/TP2 then reversed all the way
+  # to the ORIGINAL stop" - previously the stop never moved once a
+  # trade was opened, so a trade that reached a target could still give
+  # back the entire risk). Applied by jobs/signal_outcome_tracker.py. ---
+  # Once TP1 is reached, move the stop to the entry price - the trade
+  # can no longer close as a full loss, worst case is a scratch.
+  move_stop_to_breakeven_after_tp1: true
+  # Once TP2 is reached, move the stop up to TP1 - locks in at least
+  # the TP1 gain instead of only breakeven.
+  move_stop_to_tp1_after_tp2: true
 
 signal_scoring:
   buy_threshold: 2
@@ -48,6 +58,13 @@ volume_spike_watch:
   # Don't re-alert the same pair/direction again within this window.
   cooldown_seconds: 900
   # --- volume burst add-on (real traded volume, not price) ---
+  # DISABLED by default - this "N times its own baseline" check can
+  # fire on trivial pairs (e.g. $38 -> $3,909 reads as "102x!" but is a
+  # meaningless dollar amount) and was replaced by absolute_volume_watch
+  # below, which instead requires a real, fixed USDT amount regardless
+  # of what "normal" looks like for that pair. Set to true to bring
+  # this back alongside absolute_volume_watch if both are wanted.
+  volume_burst_enabled: false
   # A pair's traded volume this interval must be at least this many
   # times its own recent baseline to count as a "burst".
   volume_burst_multiplier: 5.0
@@ -59,6 +76,73 @@ volume_spike_watch:
   # volume was at/below this (USDT) - i.e. it really was quiet before.
   # 0 disables the filter and considers every pair regardless of size.
   volume_burst_low_floor_usdt: 0
+
+# --- 24/7 Market Analyse add-on #1: ABSOLUTE volume burst ---
+# Separate from volume_spike_watch's "N times its own baseline" check
+# above - this instead flags a pair the moment its traded volume
+# crosses a fixed absolute USDT amount within a rolling window,
+# regardless of what "normal" is for that pair (e.g. a pair that
+# usually does ~100k/interval suddenly trading 60M+ within 30 minutes).
+absolute_volume_watch:
+  enabled: true
+  # The rolling comparison window - "60M+ within THIS many seconds".
+  window_seconds: 1800  # 30 minutes
+  absolute_threshold_usdt: 60000000  # 60,000,000 USDT
+  # Ticks aren't always perfectly spaced (a bot hiccup, a chat joining
+  # mid-cycle, etc.), so the ACTUAL elapsed time between "now" and the
+  # sample being compared against is measured every time and the
+  # threshold is scaled to match it (e.g. if the real gap ended up
+  # being 42 minutes instead of 30, the bar to clear scales up
+  # proportionally) - this is what keeps "X+ within Y minutes"
+  # meaningful even if window_seconds above gets edited later or a
+  # tick lands late, instead of silently comparing against the wrong
+  # timeframe.
+  cooldown_seconds: 1800
+
+# --- 24/7 Market Analyse add-on #2: daily reset big-mover ---
+# Once a day, at reset_hour_utc, this remembers each pair's price as
+# that day's baseline; if a pair's price is ever move_threshold_pct+
+# away from ITS OWN day-start price before the next reset, it's
+# flagged - a slower-moving companion to the 24h%-change ticker field,
+# since 24h% is a rolling window that doesn't line up with any fixed
+# clock time. reset_hour_utc: 0 = 00:00 UTC = 06:00 in Bangladesh
+# (UTC+6) - adjust if the "daily reset" should land at a different
+# local time.
+daily_mover_watch:
+  enabled: true
+  reset_hour_utc: 0
+  # Separate bars for up vs down moves since a downside move matters
+  # sooner/at a smaller size than an equivalent upside move - both
+  # directions are checked every tick regardless (this always sends
+  # for either an up OR a down move once its own threshold is hit, not
+  # just up).
+  up_threshold_pct: 60.0
+  down_threshold_pct: 40.0
+
+# --- 24/7 Market Analyse add-on #3: per-pair volatility tiers ---
+# Some pairs (BTC, ETH, SOL, ...) rarely move more than a few % a day,
+# so the general spike_pct_threshold above (20%+) would basically
+# never fire for them and isn't the right bar - a much smaller move,
+# CONFIRMED by real candle volume (so it isn't just noise/a wick), is
+# already significant. Add more tiers/symbols here as needed; any pair
+# not listed in a tier just stays on the general watchers above.
+volatility_tier_watch:
+  enabled: true
+  # How often (seconds) candles are actually re-fetched per pair - kept
+  # well above the main poll_interval_seconds since candle calls are
+  # heavier than a ticker snapshot and a 30m/1m candle doesn't need
+  # checking every 15 seconds anyway.
+  refresh_seconds: 60
+  cooldown_seconds: 1800
+  tiers:
+    - symbols: ["BTCUSDT"]
+      pct_threshold: 3.0
+      candle_interval: "30m"
+      min_candle_volume_usdt: 10000
+    - symbols: ["ETHUSDT", "SOLUSDT"]
+      pct_threshold: 5.0
+      candle_interval: "1m"
+      min_candle_volume_usdt: 1000000
 
 # --- Phase 2.2: "Find Strong Signal" 24/7 scanner ---
 strong_signal_watch:
@@ -94,10 +178,58 @@ search_signal:
   worker_count: 8
   top_n: 3
 
+# --- Wallet Balance / Money Management add-on ---
+# Position size + leverage suggestion attached to every signal
+# (Search Signal, Find Strong Signal, Single Pair Analyse), computed
+# from the balance the user typed into the "Wallet Balance" button -
+# see engine/risk_manager.py for the formula and bot/state_store.py
+# for where the balance itself lives. NOT financial advice or a
+# guarantee - it's a fixed-risk-per-trade calculator: it sizes the
+# position so a stop-loss hit costs a fixed, known % of the wallet.
+money_management:
+  # % of the stored wallet balance risked if the stop-loss is hit.
+  risk_pct_per_trade: 2.0
+  # Never suggest below this leverage, even on pairs with a very tight
+  # stop (where the pure risk-% formula alone would ask for less).
+  min_leverage: 3
+  # Safety ceiling - never suggest above this, no matter how far the
+  # formula's own math would want to go.
+  max_leverage: 20
+  # Optional per-pair floor overrides, e.g.:
+  #   min_leverage_by_pair:
+  #     "BTC/USDT": 5
+  #     "ETH/USDT": 5
+  # Falls back to min_leverage above for any pair not listed here.
+  min_leverage_by_pair: {}
+
 symbols:
   watchlist:
     - "BTCUSDT"
     - "ETHUSDT"
+
+# Automatically checks whether each signal's real Entry/SL/TP1-3 levels
+# actually got hit, using live candle data - powers the "📊 Signal
+# Outcomes" button. Runs globally (not per-chat, no on/off toggle in
+# the bot itself - just this one enabled flag).
+signal_outcome_tracker:
+  enabled: true
+  poll_interval_seconds: 300  # 5 minutes
+
+# --- Anti-sleep / status heartbeat (Render free-tier keep-alive) ---
+# The health-check server (bot/main.py) already keeps the process
+# awake at the HTTP level when an uptime monitor hits it - this adds a
+# VISIBLE hourly confirmation on top of that: a Telegram message sent
+# to chat_id proving the bot never slept, plus a live snapshot of
+# everything running 24/7 right now (see jobs/heartbeat.py).
+# chat_id is left blank here on purpose - set HEARTBEAT_CHAT_ID in
+# .env instead (a personal chat id doesn't belong in a file that's
+# safe to commit); bot/main.py copies it in at startup. Heartbeat
+# stays silent (no-op, no error) if that's left unset.
+heartbeat:
+  enabled: true
+  interval_seconds: 3600  # 1 hour
+  chat_id: null
+
 
 logging:
   level: "INFO"

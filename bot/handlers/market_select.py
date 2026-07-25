@@ -35,7 +35,7 @@ from telegram.ext import ContextTypes
 
 from bot import state_store
 from bot.formatters import (
-    format_final_signal_scan,
+    format_signal_scan_block,
     format_pair_detail_batch,
     format_pair_detail_block,
     format_progress_message,
@@ -59,6 +59,18 @@ PROGRESS_MILESTONES = (10, 25, 50, 75, 100)
 # trying to send one message per pair (which would trip Telegram's
 # flood limits and could stall/drop messages).
 DETAIL_BATCH_SIZE = 8
+
+# Telegram hard-caps a single message at 4096 characters. Stay
+# comfortably under that even after the "\n\n" join separators and
+# occasional Markdown escaping, so a batch of otherwise-fine pair
+# blocks doesn't get rejected outright ("Message is too long") the
+# moment a couple of pairs have unusually long indicator/concept text.
+# Kept well under the real 4096 limit (not just "a bit under") since
+# Python's len() undercounts some things Telegram's own limit counts
+# more expensively (certain emoji/multi-codepoint characters) - this
+# margin, plus the _send_batch_or_split fallback below, is the actual
+# safety net rather than a precisely-tuned number.
+TELEGRAM_SAFE_BATCH_CHARS = 3000
 
 
 def _keyboard(pending_action: str) -> InlineKeyboardMarkup:
@@ -225,15 +237,50 @@ async def _run_search_signal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
                     parse_mode="Markdown",
                 ))
 
+    async def _send_batch_or_split(blocks: list) -> None:
+        """
+        Sends several pair-detail blocks as one message; if Telegram
+        rejects it as too long anyway (the size threshold above is an
+        estimate, not a guarantee - some emoji/characters cost Telegram
+        more than Python's len() suggests), falls back to sending each
+        block in that batch as its own message instead of losing the
+        whole batch of results.
+        """
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=format_pair_detail_batch(blocks), parse_mode="Markdown",
+            )
+        except Exception as exc:
+            if "too long" in str(exc).lower() and len(blocks) > 1:
+                log.warning(
+                    f"Search signal: batch of {len(blocks)} pair blocks too long for chat {chat_id}, "
+                    f"falling back to sending each individually: {exc}"
+                )
+                for b in blocks:
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=b, parse_mode="Markdown")
+                    except Exception as exc2:
+                        log.error(f"Search signal: failed to deliver an individual pair block to chat {chat_id}: {exc2}")
+            else:
+                raise
+
     def on_pair(result: dict) -> None:
         if not full_analysis:
             return
         pair_counter["n"] += 1
-        detail_buffer.append(format_pair_detail_block(pair_counter["n"], result))
-        if len(detail_buffer) >= DETAIL_BATCH_SIZE:
-            batch_text = format_pair_detail_batch(detail_buffer)
+        block = format_pair_detail_block(pair_counter["n"], result)
+
+        # Flush BEFORE appending if this next block would push the
+        # batch over Telegram's ~4096 char hard limit - pairs with long
+        # indicator/concept lists can make even 8 blocks too long, and
+        # a batch that's too long fails to send entirely (whole batch
+        # of pairs silently dropped), not just gets truncated.
+        prospective_length = sum(len(b) for b in detail_buffer) + len(detail_buffer) * 2 + len(block)
+        if detail_buffer and (len(detail_buffer) >= DETAIL_BATCH_SIZE or prospective_length > TELEGRAM_SAFE_BATCH_CHARS):
+            _send_async(_send_batch_or_split(list(detail_buffer)))
             detail_buffer.clear()
-            _send_async(context.bot.send_message(chat_id=chat_id, text=batch_text, parse_mode="Markdown"))
+
+        detail_buffer.append(block)
 
     try:
         result = await loop.run_in_executor(
@@ -256,9 +303,7 @@ async def _run_search_signal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
 
     # Flush any leftover buffered detail blocks that didn't fill a full batch.
     if full_analysis and detail_buffer:
-        await context.bot.send_message(
-            chat_id=chat_id, text=format_pair_detail_batch(detail_buffer), parse_mode="Markdown",
-        )
+        await _send_batch_or_split(list(detail_buffer))
 
     # Final Signal Scan #1/#2/#3, strictly by confidence (highest
     # first) - distinct from scan_market()'s own topPicks, which ranks
@@ -269,10 +314,36 @@ async def _run_search_signal(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
         reverse=True,
     )
     top3 = ranked[:3]
-    for r in top3:
+    settings = context.bot_data.get("settings", {})
+    mm_cfg = settings.get("money_management", {})
+    wallet_bal = state_store.get_wallet_balance(chat_id)
+
+    if not top3:
+        await context.bot.send_message(
+            chat_id=chat_id, text="🔎 Scan complete — no tradeable setup found right now. Try again later.",
+        )
+        return
+
+    batch_ts = state_store.now_iso()
+    for i, r in enumerate(top3, start=1):
+        block_text = format_signal_scan_block(i, r, wallet_bal, mm_cfg)
         state_store.log_signal(
             chat_id, "search", r.get("exchange", ""), r.get("symbol", "?"),
             r.get("verdict", "?"), r.get("multiTimeframe", {}).get("combinedConfidence", 0),
+            message_text=block_text, batch_ts=batch_ts, scan_index=i,
         )
-    text = format_final_signal_scan(top3)
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        plan = r.get("tradePlan")
+        if plan:
+            state_store.record_signal_outcome_tracking(
+                chat_id, "search", r.get("exchange", ""), r.get("rawSymbol", ""),
+                r.get("symbol", "?"), r.get("verdict", "?"),
+                plan["entry"], plan["stopLoss"], plan.get("tp1"), plan.get("tp2"), plan.get("tp3"),
+            )
+        # Sent as its OWN message rather than joined with the other 2 -
+        # each block now includes a full Money Management section, and
+        # 3 joined together can exceed Telegram's ~4096-char hard limit
+        # ("Message is too long"), which previously failed the ENTIRE
+        # result silently (the person got nothing at all, not even a
+        # partial result). One block alone is comfortably under that
+        # limit even with Money Management included.
+        await context.bot.send_message(chat_id=chat_id, text=block_text, parse_mode="Markdown")

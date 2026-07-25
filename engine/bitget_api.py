@@ -270,13 +270,14 @@ def fetch_bitget_spot_candles(symbol, granularity_key, limit=None):
     )
 
 
-def format_symbol_display(raw):
-    """Turns a raw exchange symbol slug ("BTCUSDT") into "BTC/USDT" for display."""
-    quote_assets = ["USDT", "USDC", "BTC", "ETH", "EUR", "USD"]
-    for quote in quote_assets:
-        if raw.endswith(quote) and len(raw) > len(quote):
-            return raw[: -len(quote)] + "/" + quote
-    return raw
+def format_symbol_display(raw, is_future=False):
+    """
+    Display symbol for a raw exchange slug. No "/" separator - just the
+    plain slug (e.g. "BTCUSDT"). Future pairs get a ".P" suffix
+    (e.g. "BTCUSDT.P") to disambiguate from the identically-named spot
+    pair; spot pairs are shown as-is.
+    """
+    return f"{raw}.P" if is_future else raw
 
 
 def fetch_bitget_spot_tickers():
@@ -291,7 +292,7 @@ def fetch_bitget_spot_tickers():
     rows = resp.json().get("data", [])
     return [
         {
-            "symbol": format_symbol_display(r["symbol"]),
+            "symbol": format_symbol_display(r["symbol"], is_future=False),
             "rawSymbol": r["symbol"],
             "lastPrice": float(r.get("lastPr") or 0),
             "change24h": _parse_pct_change(r.get("change24h")),
@@ -304,7 +305,13 @@ def fetch_bitget_spot_tickers():
 
 
 def fetch_bitget_futures_tickers(product_type="usdt-futures"):
-    """Same idea as fetch_bitget_spot_tickers(), for USDT-margined futures contracts."""
+    """
+    Same idea as fetch_bitget_spot_tickers(), for USDT-margined futures
+    contracts. Bitget's own tickers payload already carries fundingRate
+    and holdingAmount (open interest, in base-asset units) alongside
+    the price/volume fields already used below - no separate endpoint
+    call needed to get them.
+    """
     resp = _http_session.get(
         "https://api.bitget.com/api/v2/mix/market/tickers",
         params={"productType": product_type},
@@ -314,13 +321,15 @@ def fetch_bitget_futures_tickers(product_type="usdt-futures"):
     rows = resp.json().get("data", [])
     return [
         {
-            "symbol": format_symbol_display(r["symbol"]),
+            "symbol": format_symbol_display(r["symbol"], is_future=True),
             "rawSymbol": r["symbol"],
             "lastPrice": float(r.get("lastPr") or 0),
             "change24h": _parse_pct_change(r.get("change24h")),
             "high24h": r.get("high24h"),
             "low24h": r.get("low24h"),
             "usdtVolume24h": float(r.get("usdtVolume") or 0),
+            "fundingRate": float(r["fundingRate"]) if r.get("fundingRate") not in (None, "") else None,
+            "openInterest": float(r["holdingAmount"]) if r.get("holdingAmount") not in (None, "") else None,
         }
         for r in rows
     ]

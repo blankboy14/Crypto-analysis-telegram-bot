@@ -1,112 +1,102 @@
-# crypto-telegram-bot
+# Keep-alive + status dashboard — setup
 
-Telegram bot version of the crypto-analyzer web app - same analysis
-engine (indicators, trading concepts, signal scanner, Bitget adapter),
-delivered through a Telegram bot instead of a browser dashboard.
-
-## Build status
-
-This project is complete - every file in the file plan (`bot/`,
-`jobs/`, `database/`, `engine/`, `tests/`) is implemented and the bot
-runs end to end via `python -m bot.main`.
-
-## Setup
-
-1. **Install Python 3.10+** if you don't have it already.
-
-2. **Create a virtual environment (recommended):**
-   ```
-   python -m venv venv
-   venv\Scripts\activate        # Windows
-   source venv/bin/activate     # macOS/Linux
-   ```
-
-3. **Install dependencies:**
-   ```
-   pip install -r requirements.txt
-   ```
-
-4. **Get a Telegram bot token:**
-   - Open a chat with [@BotFather](https://t.me/BotFather) on Telegram
-   - Send `/newbot` and follow the prompts
-   - Copy the token it gives you
-
-5. **Set up your `.env` file:**
-   - Copy `.env.example` to `.env` (or just edit the `.env` already in
-     this drop)
-   - Paste your bot token into `TELEGRAM_BOT_TOKEN=`
-   - `ALPHA_VANTAGE_API_KEY` is optional - only powers one extra news
-     source, everything else works without it
-
-6. **Tune behaviour (optional):** `config/settings.yaml` holds every
-   adjustable number - indicator periods, volume-spike thresholds,
-   signal-confidence cutoffs, scan intervals, etc. Nothing in here is a
-   secret, so it's safe to edit and commit.
-
-## Running
+Two new files, drop them straight into your project (same folder
+structure):
 
 ```
-python -m bot.main
+jobs/keepalive.py      <- new file
+web/__init__.py        <- new file (empty)
+web/dashboard.py       <- new file
 ```
 
-## Deploying to Render.com
+Nothing else was touched. To actually turn them on, `bot/main.py`
+needs 2 tiny edits — I did not make these for you since you asked for
+files only, but they are copy-paste and low risk. Here they are,
+exactly:
 
-This repo includes a `render.yaml` blueprint, so Render can configure
-most of this automatically:
+## Edit 1 — imports
 
-1. Push this repo to GitHub (see the note in `.gitignore` below first -
-   your real `.env` never gets committed, which is exactly what you want).
-2. In the Render dashboard: **New -> Blueprint**, pick this GitHub repo.
-   Render reads `render.yaml` and proposes the service - review and
-   click **Apply**.
-3. When prompted, paste your real `TELEGRAM_BOT_TOKEN` (and
-   `ALPHA_VANTAGE_API_KEY` if you have one) - these are entered directly
-   in Render's dashboard as environment variables, never through the repo.
-4. Deploy. Render runs `pip install -r requirements.txt` then
-   `python -m bot.main`.
+Find this line near the top of `bot/main.py`:
 
-**Two things to understand before relying on this in production**
-(also documented inline in `render.yaml`):
+```python
+from jobs import heartbeat, signal_outcome_tracker
+```
 
-- **Free tier sleeps.** Render's free Web Services spin down after
-  ~15 minutes with no inbound HTTP traffic, and nothing ever calls this
-  bot's health-check endpoint on its own - so a free instance *will*
-  go to sleep and stop polling Telegram, breaking the "24/7" part
-  entirely. For genuine always-on behaviour, either:
-  - Upgrade to Render's **Starter** plan (`plan: starter` in
-    `render.yaml`) - stays running continuously, no sleep, and unlocks
-    persistent disks (see below); or
-  - Stay on free and use an external uptime pinger (e.g.
-    [UptimeRobot](https://uptimerobot.com)) to hit your Render URL
-    every ~10 minutes. This works but isn't bulletproof (cold starts
-    add a delay, and Render's free plan has a shared monthly hour cap
-    across all your free services).
+Replace it with:
 
-- **SQLite state resets on the free tier.** `database/bot_state.db`
-  (who has which mode ON) lives on local disk. Render's filesystem is
-  ephemeral on the free plan - every restart/redeploy wipes it, so
-  users would need to re-toggle their modes afterward. This doesn't
-  break anything, it just means state isn't remembered across
-  restarts. If you're on the paid Starter plan, uncomment the `disk:`
-  block in `render.yaml` to attach a persistent disk and this stops
-  being a concern.
+```python
+from jobs import heartbeat, keepalive, signal_outcome_tracker
+from web.dashboard import start_dashboard_server
+```
 
-## Project layout
+## Edit 2 — start it in `main()`
 
-`bot/` - the Telegram-facing layer: keyboards, per-button handlers,
-message formatting, and per-chat mode state (`state_store.py`,
-backed by SQLite). `jobs/` - the two 24/7 background watchers
-(`volume_spike_watcher.py`, `strong_signal_watcher.py`), each scheduled
-per-chat via `python-telegram-bot`'s job queue when a user turns a mode
-on. `engine/` - the analysis engine (indicators, trading concepts,
-signal scanner, Bitget adapter, order flow, news), carried over from
-the original web dashboard project. `database/` - the SQLite state
-file plus the shipped default indicator on/off toggles. `tests/` -
-sanity tests for the indicator engine.
+Find this near the bottom of `bot/main.py`:
 
-## Notes
+```python
+def main() -> None:
+    settings = load_settings()
+    configure_logging(settings)
 
-- `database/bot_state.db` (per-user toggle/mode state) and `logs/` are
-  git-ignored - they're runtime data, not source.
-- `database/indicator_toggles.json` IS committed - it's the shipped
-  default indicator on/off state, not a runtime file.
+    _start_health_server()
+
+    application = build_application(settings)
+```
+
+Replace the `_start_health_server()` line with:
+
+```python
+    start_dashboard_server()
+    keepalive.start()
+```
+
+That's the whole change — 3 lines added, 1 line swapped. You can leave
+the old `_start_health_server` function sitting unused in the file, or
+delete it; either is fine.
+
+## New .env values (add to your `.env`, and to Render's dashboard env vars)
+
+```
+PUBLIC_URL=https://crypto-analysis-telegram-bot.onrender.com
+KEEPALIVE_INTERVAL_MINUTES=10
+KEEPALIVE_TELEGRAM_NOTIFY=true
+```
+
+- `PUBLIC_URL` — your Render URL. **Required** — without it the
+  keep-alive silently does nothing (it logs why and the bot still runs
+  fine, it just won't self-ping).
+- `KEEPALIVE_INTERVAL_MINUTES` — how often it pings itself. 10 is safe
+  (Render sleeps at 15 min idle). Don't go above 14.
+- `KEEPALIVE_TELEGRAM_NOTIFY` — `true` sends a Telegram message on
+  every check (~every 10 min, on top of your existing hourly
+  heartbeat). Set to `false` if that's too many messages — the web
+  dashboard still shows the same info either way, silently.
+
+`requests` is already in your `requirements.txt`, so no dependency
+changes needed.
+
+## What you get
+
+- Visit `https://crypto-analysis-telegram-bot.onrender.com` any time →
+  a small dark dashboard showing current time, last check, next
+  check, check/fail counts, and process uptime. Auto-refreshes every
+  30s.
+- `https://crypto-analysis-telegram-bot.onrender.com/status` → same
+  data as JSON.
+- Telegram messages (if enabled) confirming each check, to the same
+  chat as your existing hourly heartbeat (`HEARTBEAT_CHAT_ID`).
+
+## The honest limits (please read)
+
+- This **prevents** sleep, it can't **undo** it — if the process is
+  already down (asleep, crashed, redeploying), it can't ping itself
+  awake, because it isn't running. Keeping the interval at 10 minutes
+  is what stops that situation from happening in normal use.
+- Render's free plan includes 750 instance-hours/month/workspace. One
+  service running 24/7 uses roughly 730–745 hours/month, so this fits
+  — as long as it's the *only* free service in that Render workspace.
+  A second always-on free service in the same workspace could run out
+  of hours before the month ends.
+- Belt-and-suspenders option, free, no conflict with any of this: also
+  point an external monitor (UptimeRobot, cron-job.org) at the same
+  `PUBLIC_URL` every 5–10 min. Redundant pings do no harm.

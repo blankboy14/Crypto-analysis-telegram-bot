@@ -257,21 +257,48 @@ async def tick(context) -> None:
 
     state_store.log_scan(chat_id, "watcher", market, "success", scanned_count=scan.get("scanned"))
 
+    # --- single-signal-at-a-time push (was: loop + send EVERY qualifying
+    # pair back-to-back, which is what used to dump e.g. 8 signals into
+    # the chat in one burst) ---
+    # Out of everything that cleared min_confidence_to_push AND isn't
+    # still in this chat's per-pair cooldown, only the single BEST one
+    # (highest rankScore = conviction x confidence, same ranking already
+    # used for Search Signal's top picks) goes out this tick. Every
+    # other qualifying pair simply waits for a later tick instead of
+    # being dropped - if it's still valid (and still clears cooldown)
+    # next scan, it gets its own turn then.
     now = time.time()
+    candidates = []
     for result in scan.get("strong", []):
         cooldown_key = (chat_id, result.get("rawSymbol"), result.get("verdict"))
         last = _last_push.get(cooldown_key, 0)
         if now - last < cooldown_seconds:
             continue
+        candidates.append(result)
 
+    if candidates:
+        candidates.sort(key=lambda r: r.get("rankScore", 0), reverse=True)
+        result = candidates[0]
+        cooldown_key = (chat_id, result.get("rawSymbol"), result.get("verdict"))
         try:
-            text = format_strong_signal(result)
+            mm_cfg = settings.get("money_management", {})
+            wallet_bal = state_store.get_wallet_balance(chat_id)
+            serial = state_store.next_signal_serial(chat_id, "watcher")
+            text = format_strong_signal(result, serial, wallet_bal, mm_cfg)
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
             _last_push[cooldown_key] = now
             state_store.log_signal(
                 chat_id, "watcher", result.get("exchange", ""), result.get("symbol", "?"),
                 result.get("verdict", "?"), result.get("multiTimeframe", {}).get("combinedConfidence", 0),
+                message_text=text,
             )
+            plan = result.get("tradePlan")
+            if plan:
+                state_store.record_signal_outcome_tracking(
+                    chat_id, "watcher", result.get("exchange", ""), result.get("rawSymbol", ""),
+                    result.get("symbol", "?"), result.get("verdict", "?"),
+                    plan["entry"], plan["stopLoss"], plan.get("tp1"), plan.get("tp2"), plan.get("tp3"),
+                )
         except Exception as exc:
             log.error(f"Strong signal watch: failed to send push to chat {chat_id}: {exc}")
 
@@ -297,6 +324,8 @@ async def tick(context) -> None:
             )
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
             _last_pump_push[cooldown_key] = now
-            state_store.log_signal(chat_id, "watcher", event["scope"], event["symbol"], "SELL", event["dropPct"])
+            state_store.log_signal(
+                chat_id, "watcher", event["scope"], event["symbol"], "SELL", event["dropPct"], message_text=text,
+            )
         except Exception as exc:
             log.error(f"Pump reversal watch: failed to send push to chat {chat_id}: {exc}")

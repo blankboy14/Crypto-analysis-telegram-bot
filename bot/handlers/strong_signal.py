@@ -8,10 +8,15 @@ jobs.strong_signal_watcher.tick on this chat's job_queue every
 `strong_signal_watch.scan_interval_seconds` (config/settings.yaml).
 That job runs the same indicator/concept/order-flow pipeline as the
 web version (via engine.signal_scanner.scan_market_above_confidence),
-and pushes every pair whose confidence is at/above
-`strong_signal_watch.min_confidence_to_push` (80 by default) - not
-just a top-3 shortlist, since the point of this mode is "don't miss
-a high-conviction setup", however many show up.
+and pushes ONE signal per tick - the single best-ranked pair whose
+confidence is at/above `strong_signal_watch.min_confidence_to_push`
+(80 by default) and isn't still in this chat's per-pair cooldown.
+This is deliberately one-at-a-time (not a burst of everything that
+qualifies at once): every candidate gets the full itemized breakdown
+(indicator performance, concept performance, order flow, funding
+rate, open interest, trade reason, confidence), and other qualifying
+pairs simply get their own turn on a later tick instead of being
+dumped into the chat together.
 
 OFF: cancels that job. No market prompt for OFF.
 
