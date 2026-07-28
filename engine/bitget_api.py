@@ -415,3 +415,94 @@ def fetch_bitget_futures_candles(symbol, granularity_key, limit=None, product_ty
         history_granularity_map=BITGET_FUTURES_GRANULARITIES,
         history_max_limit=BITGET_FUTURES_HISTORY_MAX_LIMIT_PER_CALL,
     )
+
+# =========================================================================
+# --- Per-pair futures contract limits (real max leverage + min order size) ---
+# Used by engine/risk_manager.py's live money-management calculator -
+# neither number was fetched anywhere in this file before.
+# =========================================================================
+
+_contract_config_cache = {"data": {}, "ts": 0}
+CONTRACT_CONFIG_CACHE_TTL_SECONDS = 3600  # leverage/min-size limits change rarely - an hour is plenty fresh
+
+
+def fetch_bitget_futures_contract_config(product_type="usdt-futures"):
+    """
+    Per-pair contract limits for USDT-margined futures: the real
+    maximum leverage Bitget allows on THAT SPECIFIC pair (majors can
+    run 100x+; plenty of alts cap far lower), and the smallest order
+    size (in the base asset) a single order can be. Both vary per pair
+    and neither was available anywhere else already fetched in this
+    file - this is what powers "why does 1-2 USDT show 0 on some
+    pairs but not others" in the money-management calculator.
+
+    Returns {rawSymbol: {"maxLeverage": int|None, "minTradeSize": float|None}}.
+    Cached for CONTRACT_CONFIG_CACHE_TTL_SECONDS since these limits
+    change rarely - definitely not worth a fresh call on every signal.
+
+    HONESTY NOTE: unlike every other function in this file, the two
+    field names this reads (maxLever / minTradeNum) are NOT confirmed
+    against a live call - this sandbox has no internet access to
+    verify them. This tries the documented/most-likely key first, a
+    couple of known alternates second, and - critically - logs a
+    clear ERROR if NONE of a whole batch of contracts have a usable
+    value for either field, so a wrong key name fails loud in the logs
+    instead of silently poisoning every leverage suggestion with
+    wrong numbers. If that happens, send the log line over and this
+    gets a one-line fix once the real field name is confirmed.
+    """
+    now = time.time()
+    cached = _contract_config_cache
+    if cached["data"] and (now - cached["ts"]) < CONTRACT_CONFIG_CACHE_TTL_SECONDS:
+        return cached["data"]
+
+    resp = _http_session.get(
+        "https://api.bitget.com/api/v2/mix/market/contracts",
+        params={"productType": product_type},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    rows = resp.json().get("data", [])
+
+    result = {}
+    unmapped_leverage = 0
+    unmapped_min_size = 0
+    for r in rows:
+        symbol = r.get("symbol")
+        if not symbol:
+            continue
+
+        max_lev_raw = r.get("maxLever") or r.get("maxLeverage") or r.get("openMaxLever")
+        try:
+            max_leverage = int(float(max_lev_raw)) if max_lev_raw is not None else None
+        except (TypeError, ValueError):
+            max_leverage = None
+        if max_leverage is None:
+            unmapped_leverage += 1
+
+        min_size_raw = r.get("minTradeNum") or r.get("minTradeAmount")
+        try:
+            min_trade_size = float(min_size_raw) if min_size_raw is not None else None
+        except (TypeError, ValueError):
+            min_trade_size = None
+        if min_trade_size is None:
+            unmapped_min_size += 1
+
+        result[symbol] = {"maxLeverage": max_leverage, "minTradeSize": min_trade_size}
+
+    if rows and unmapped_leverage == len(rows):
+        log.error(
+            "Bitget contract config: couldn't find a usable max-leverage field on ANY contract "
+            "(tried maxLever/maxLeverage/openMaxLever) - Bitget's field name has likely changed. "
+            "Money-management leverage numbers will fall back to the DEFAULT_MAX_LEVERAGE constant until this is fixed."
+        )
+    if rows and unmapped_min_size == len(rows):
+        log.error(
+            "Bitget contract config: couldn't find a usable min-order-size field on ANY contract "
+            "(tried minTradeNum/minTradeAmount) - Bitget's field name has likely changed. "
+            "The 'position too small' check will be skipped until this is fixed."
+        )
+
+    cached["data"] = result
+    cached["ts"] = now
+    return result

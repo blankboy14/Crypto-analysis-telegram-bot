@@ -155,7 +155,19 @@ async def handle_pair_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             continue
 
-        report_text = format_single_pair_report(result, wallet_bal, mm_cfg)
+        trade_id = None
+        if result.get("tradeable"):
+            plan = result.get("tradePlan")
+            if plan:
+                trade_id = state_store.record_signal_outcome_tracking(
+                    chat_id, "single_pair", scope, result.get("rawSymbol", ""),
+                    result.get("symbol", "?"), result.get("verdict", "?"),
+                    plan["entry"], plan["stopLoss"], plan.get("tp1"), plan.get("tp2"), plan.get("tp3"),
+                    confidence=result.get("multiTimeframe", {}).get("combinedConfidence", 0),
+                    scan_label="Single Pair Analyse",
+                )
+
+        report_text = format_single_pair_report(result, wallet_bal, mm_cfg, trade_id=trade_id)
         await context.bot.send_message(chat_id=chat_id, text=report_text, parse_mode="Markdown")
         if result.get("tradeable"):
             state_store.log_signal(
@@ -163,10 +175,3 @@ async def handle_pair_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 result.get("verdict", "?"), result.get("multiTimeframe", {}).get("combinedConfidence", 0),
                 message_text=report_text,
             )
-            plan = result.get("tradePlan")
-            if plan:
-                state_store.record_signal_outcome_tracking(
-                    chat_id, "single_pair", scope, result.get("rawSymbol", ""),
-                    result.get("symbol", "?"), result.get("verdict", "?"),
-                    plan["entry"], plan["stopLoss"], plan.get("tp1"), plan.get("tp2"), plan.get("tp3"),
-                )

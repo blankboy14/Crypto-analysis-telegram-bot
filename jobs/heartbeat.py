@@ -42,18 +42,19 @@ def _format_uptime() -> str:
     return " ".join(parts)
 
 
-async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+HEARTBEAT_MESSAGE_TTL_SECONDS = 60  # how long an automatic heartbeat push stays visible before auto-deleting
+
+
+def build_heartbeat_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     """
-    Runs every `heartbeat.interval_seconds` (config/settings.yaml,
-    default 1 hour). Silently does nothing if no chat_id is configured
-    (HEARTBEAT_CHAT_ID unset in .env) rather than erroring every tick.
+    The actual status snapshot - factored out so both the automatic
+    hourly push (tick(), below) and the on-demand "🖥 Server
+    Information" -> "Server Status" button (bot/handlers/
+    server_information.py) show IDENTICAL, always-live data. Nothing
+    here is a cached/stale copy - every call recomputes fresh from
+    state_store and the process's own start time.
     """
     settings = context.bot_data.get("settings", {})
-    cfg = settings.get("heartbeat", {})
-    chat_id = cfg.get("chat_id")
-    if not chat_id:
-        return
-
     now = datetime.now(timezone.utc)
 
     outcome_cfg = settings.get("signal_outcome_tracker", {})
@@ -80,10 +81,45 @@ async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(f"🔥 Find 24/7 Strong Signal — ON in {strong_signal_chats} chat(s)")
     lines.append("")
     lines.append("No sleep detected — everything's running normally ✅")
+    return "\n".join(lines)
 
-    text = "\n".join(lines)
+
+async def _delete_later(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """job_queue.run_once callback - deletes ONE automatic heartbeat push after HEARTBEAT_MESSAGE_TTL_SECONDS. Only ever removes the message from the chat; nothing about the heartbeat data itself is touched (it's recomputed fresh every tick anyway, never stored per-message)."""
+    data = context.job.data
+    try:
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+    except Exception:
+        pass  # already deleted/too old/etc - never worth erroring over
+
+
+async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Runs every `heartbeat.interval_seconds` (config/settings.yaml,
+    default 1 hour). Silently does nothing if no chat_id is configured
+    (HEARTBEAT_CHAT_ID unset in .env) rather than erroring every tick.
+
+    The push still happens every hour same as before (still useful
+    proof the scheduler itself is alive and ticking on time) - it just
+    no longer sits in the chat forever. It's deleted
+    HEARTBEAT_MESSAGE_TTL_SECONDS later automatically. For a persistent,
+    on-demand look at the exact same data any time, see "🖥 Server
+    Information" -> "Server Status" (bot/handlers/server_information.py),
+    which never auto-deletes since it's something the person asked for.
+    """
+    settings = context.bot_data.get("settings", {})
+    cfg = settings.get("heartbeat", {})
+    chat_id = cfg.get("chat_id")
+    if not chat_id:
+        return
+
+    text = build_heartbeat_text(context)
 
     try:
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        context.job_queue.run_once(
+            _delete_later, when=HEARTBEAT_MESSAGE_TTL_SECONDS,
+            data={"chat_id": chat_id, "message_id": sent.message_id},
+        )
     except Exception:
         log.error("Heartbeat: failed to send status message", exc_info=True)

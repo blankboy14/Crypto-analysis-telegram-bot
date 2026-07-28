@@ -36,14 +36,19 @@ def _fmt_price(value) -> str:
 
 def _send_time_line() -> str:
     """
-    'Send Time: 14:32:07 UTC | Date: 24-07-2026' - stamped fresh at the
-    moment each signal message is actually formatted/sent, so the user
-    can tell exactly when a signal went out (useful once several
-    signals for the same or different pairs have piled up in a chat).
+    'Send Time: 20:32:07 BDT | 14:32:07 UTC | Date: 24-07-2026' -
+    stamped fresh at the moment each signal message is actually
+    formatted/sent. Shows BOTH BDT (UTC+6, no DST) and UTC together so
+    it lines up with whatever timezone the person's own chart is set
+    to without them having to convert it themselves.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-    return f"Send Time: `{now.strftime('%H:%M:%S')} UTC` | Date: `{now.strftime('%d-%m-%Y')}`"
+    from datetime import datetime, timezone, timedelta
+    now_utc = datetime.now(timezone.utc)
+    now_bdt = now_utc + timedelta(hours=6)
+    return (
+        f"Send Time: `{now_bdt.strftime('%H:%M:%S')} BDT` | `{now_utc.strftime('%H:%M:%S')} UTC` "
+        f"| Date: `{now_utc.strftime('%d-%m-%Y')}`"
+    )
 
 
 def _verdict_emoji(verdict: str) -> str:
@@ -158,39 +163,136 @@ def format_daily_mover_alert(pair: str, last_price: float, pct_change: float, ma
     )
 
 
+def _format_ms_touch_time(ms: int) -> str:
+    """Same BDT+UTC+Date format as _format_iso_send_time(), from a candle time in milliseconds - the exact moment a level was actually touched, not just when the tracker happened to notice it."""
+    from datetime import datetime, timezone
+    return _format_iso_send_time(datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat())
+
+
+def format_live_trade_preview(plan: dict) -> str:
+    """
+    Compact addition under a Search Signal result: what this trade
+    would ACTUALLY look like if activated right now with the full
+    saved Wallet Balance, at this pair's real max leverage - not the
+    detailed risk-based Money Management block, just the numbers that
+    matter for a quick glance (leverage, margin, $ at each level).
+    """
+    if plan.get("belowMinSize"):
+        need = plan.get("minUsdtNeeded")
+        need_str = f"at least `{need:.2f} USDT`" if need else "more balance"
+        return (
+            f"⚠️ *If Activated:* your balance is too small for this pair even at {plan['leverage']}x max leverage - "
+            f"need {need_str}."
+        )
+
+    def _line(label: str, usdt, pct) -> str | None:
+        if usdt is None:
+            return None
+        sign = "+" if usdt >= 0 else ""
+        return f"{label}: `{sign}{usdt:.2f} USDT` ({sign}{pct:.1f}%)"
+
+    lines = [
+        "*If Activated (Live Balance):*",
+        f"Leverage: `{plan['leverage']}x`  |  Margin: `{plan['balance']:.2f} USDT`",
+        _line("SL", plan.get("slUsdt"), plan.get("slPct")),
+        _line("TP1", plan.get("tp1Usdt"), plan.get("tp1Pct")),
+        _line("TP2", plan.get("tp2Usdt"), plan.get("tp2Pct")),
+        _line("TP3", plan.get("tp3Usdt"), plan.get("tp3Pct")),
+    ]
+    return "\n".join(line for line in lines if line is not None)
+
+
+def _trade_event_header(outcome: dict, touch_time_ms: int | None = None) -> str:
+    """
+    Shared header for every live tracking notification: Trade ID, the
+    signal's ORIGINAL Send Time, and (when known) the exact Touch Time
+    the level was actually crossed at - which can be well before the
+    tracker got around to noticing it, so it's kept distinct from
+    "when this message arrived".
+    """
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Trade ID   : `{outcome['tradeId']}`",
+        f"Send Time  : {_format_iso_send_time(outcome['openedAt'])}",
+    ]
+    if touch_time_ms is not None:
+        lines.append(f"Touch Time : {_format_ms_touch_time(touch_time_ms)}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+def _balance_result_block(balance_result: dict) -> str:
+    sign = "+" if balance_result["usdt"] >= 0 else ""
+    kind = "Realized" if balance_result["realized"] else "Floating"
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"💰 {kind} P/L: `{sign}{balance_result['usdt']:.2f} USDT` ({sign}{balance_result['pct']:.1f}%)",
+    ]
+    if balance_result.get("newBalance") is not None:
+        lines.append(f"Wallet Balance now: `{balance_result['newBalance']:.2f} USDT`")
+    return "\n".join(lines)
+
+
 def format_signal_outcome_update(outcome: dict, new_status: str, new_highest_tp_hit: int,
-                                  new_current_stop: float | None = None) -> str:
+                                  new_current_stop: float | None = None, is_catchup: bool = False,
+                                  touch_time_ms: int | None = None, balance_result: dict | None = None) -> str:
     """
     jobs/signal_outcome_tracker.py's notification when a tracked
     signal's price actually crosses a level - closes the loop on a
     signal that was sent earlier, automatically.
 
+    `is_catchup=True` means this level was already crossed BEFORE (or
+    shortly after) the trade was activated, and this tick is only just
+    discovering it - e.g. price already ran to TP2 and back to SL in
+    the time between the signal being sent and the person actually
+    pressing "Active a Trade". Worded as "had already" instead of
+    "just", so it doesn't read as something happening live right now.
+    `touch_time_ms` is the exact candle time the crossing happened at,
+    shown as its own "Touch Time" line - especially useful alongside
+    is_catchup, where it can be well before "now".
+
     `new_current_stop`, when set, means the stop was just trailed
     (breakeven after TP1 / up to TP1 after TP2) - called out explicitly
     so the user can see the protection actually happened, not just
     infer it from the outcome later.
+
+    `balance_result`, only present for a "List with Balance" trade:
+    {"usdt": float, "pct": float, "realized": bool, "newBalance": float|None}.
+    realized=True only at a terminal close (SL or TP3) - that's the
+    only point actual Wallet Balance changes; a TP1/TP2 touch on an
+    open position only shows realized=False "floating" P/L, no balance
+    change yet.
     """
     pair = outcome["symbol"]
     verdict = outcome["verdict"]
+    header = _trade_event_header(outcome, touch_time_ms)
+    already = "had already" if is_catchup else "just"
+    balance_suffix = f"\n{_balance_result_block(balance_result)}" if balance_result else ""
 
     if new_status == "sl_hit":
         if new_highest_tp_hit > 0:
             return (
-                f"🔁 *Stop Hit (after TP{new_highest_tp_hit})* — `{pair}` ({verdict})\n"
-                f"Reached TP{new_highest_tp_hit} earlier, then reversed and hit the (trailed) stop.\n"
+                f"📉 *Down (after TP{new_highest_tp_hit})* — `{pair}` ({verdict})\n"
+                f"{header}\n"
+                f"Price {already} reached TP{new_highest_tp_hit} earlier, then reversed and hit the (trailed) stop.\n"
                 f"_This closed as a scratch/small gain from the TP{new_highest_tp_hit} move, not a full loss - "
                 f"the stop had already been moved up to protect it._"
+                f"{balance_suffix}"
             )
         return (
-            f"🛑 *Stop Loss Hit* — `{pair}` ({verdict})\n"
-            f"_This signal didn't work out - price hit the stop loss without reaching any target._"
+            f"🛑 *Close (Stop Loss Hit)* — `{pair}` ({verdict})\n"
+            f"{header}\n"
+            f"_This signal didn't work out - price {already} hit the stop loss without reaching any target._"
+            f"{balance_suffix}"
         )
 
     tp_n = new_status.replace("tp", "").replace("_hit", "")
     if new_status == "tp3_hit":
         return (
-            f"🎯 *Final Target Reached (TP3)* — `{pair}` ({verdict})\n"
-            f"_Full target hit - the complete trade plan played out as intended._"
+            f"🎯 *Closed (Full Target — TP3)* — `{pair}` ({verdict})\n"
+            f"{header}\n"
+            f"_Full target {already} hit - the complete trade plan played out as intended._"
+            f"{balance_suffix}"
         )
     stop_note = ""
     if new_current_stop is not None:
@@ -199,9 +301,31 @@ def format_signal_outcome_update(outcome: dict, new_status: str, new_highest_tp_
         elif new_highest_tp_hit == 2:
             stop_note = f"\n_Stop moved up to TP1 (`{_fmt_price(new_current_stop)}`) - at least the TP1 gain is now locked in._"
     return (
-        f"✅ *TP{tp_n} Hit* — `{pair}` ({verdict})\n"
+        f"✅ *Touch TP-{tp_n}* — `{pair}` ({verdict})\n"
+        f"{header}\n"
+        f"Price {already} reached TP{tp_n}. "
         f"_Still tracking toward TP{int(tp_n) + 1} - will notify again if it moves further or reverses._"
         f"{stop_note}"
+        f"{balance_suffix}"
+    )
+
+
+def format_entry_arrived_update(outcome: dict, is_catchup: bool = False, touch_time_ms: int | None = None) -> str:
+    """
+    jobs/signal_outcome_tracker.py's notification the moment price
+    first touches an activated trade's entry level - the point real
+    SL/TP tracking begins. `is_catchup=True` means entry was already
+    reached before (or shortly after) activation, only just discovered
+    this tick - worded "had already" rather than "just". `touch_time_ms`
+    is the exact candle time entry was actually reached at.
+    """
+    pair = outcome["symbol"]
+    verdict = outcome["verdict"]
+    already = "had already" if is_catchup else "just"
+    return (
+        f"🟡 *Touch Entry* — `{pair}` ({verdict})\n"
+        f"{_trade_event_header(outcome, touch_time_ms)}\n"
+        f"_Price {already} reached entry (`{_fmt_price(outcome['entry'])}`) - now tracking SL/TP1/TP2/TP3 from here._"
     )
 
 
@@ -377,7 +501,8 @@ def _trade_plan_block(result: dict, wallet_balance: float | None = None, mm_cfg:
 
 
 def format_strong_signal(result: dict, serial: int | None = None,
-                          wallet_balance: float | None = None, mm_cfg: dict | None = None) -> str:
+                          wallet_balance: float | None = None, mm_cfg: dict | None = None,
+                          trade_id: str | None = None) -> str:
     """
     Phase 2.2 - ONE high-confidence result from
     engine.signal_scanner.scan_market_above_confidence(), sent by
@@ -406,6 +531,10 @@ def format_strong_signal(result: dict, serial: int | None = None,
     lines = [
         f"*Trade Signal {serial_str}*".strip(),
         f"`{pair}`  —  24H: *{change_str}*",
+    ]
+    if trade_id:
+        lines.append(f"Trade ID : `{trade_id}`")
+    lines += [
         "",
         "*Indicator Performance*",
         _bullet_votes(result.get("indicatorVotes"), result.get("indicatorInfo", "N/A")),
@@ -633,24 +762,40 @@ def format_pair_detail_batch(blocks: list) -> str:
 
 
 def format_signal_scan_block(index: int, result: dict, wallet_balance: float | None = None,
-                              mm_cfg: dict | None = None) -> str:
+                              mm_cfg: dict | None = None, trade_id: str | None = None,
+                              live_preview: dict | None = None) -> str:
     """
     ONE "Signal Scan #N" block - factored out of format_final_signal_scan
     so the handler can log the exact text of each individual result
     (for the Search Signal Status button) while still sending them all
     joined together as one message, same as before.
+
+    `trade_id` prints right under the header, right where the person
+    needs it to note down/copy before it scrolls off - this is the
+    number they'll later type into "Active a Trade" to start tracking
+    this exact signal.
+
+    `live_preview`, when given (engine.risk_manager.compute_live_trade_plan's
+    output - FUTURES pairs only), appends a compact "what would
+    actually happen if activated right now" block using the pair's
+    real max leverage and the full saved Wallet Balance - separate
+    from the risk-based Money Management block above it.
     """
     confidence = result.get("multiTimeframe", {}).get("combinedConfidence", 0)
     verdict = result.get("verdict", "?")
     pair = result.get("symbol", "?")
+    trade_id_line = f"Trade ID : `{trade_id}`\n" if trade_id else ""
+    live_preview_block = f"\n━━━━━━━━━━━━━━━━━━━━\n{format_live_trade_preview(live_preview)}" if live_preview else ""
     return (
         f"📡 *Signal Scan #{index}*\n"
+        f"{trade_id_line}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{_verdict_emoji(verdict)} *{verdict}* — `{pair}`\n"
         f"Confidence: *{confidence:.0f}/100*\n"
         f"{_send_time_line()}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{_trade_plan_block(result, wallet_balance, mm_cfg)}"
+        f"{live_preview_block}"
     )
 
 
@@ -700,7 +845,74 @@ def _bullet_votes(votes: list, joined_fallback: str) -> str:
     return "\n".join(lines)
 
 
-def format_single_pair_report(result: dict, wallet_balance: float | None = None, mm_cfg: dict | None = None) -> str:
+def format_full_analysis_block(index: int, result: dict, wallet_balance: float | None = None,
+                                mm_cfg: dict | None = None) -> str:
+    """
+    "Full Analysis" mode's per-pair report - sent as its OWN message,
+    one pair at a time, as each pair finishes scanning (not batched
+    several-per-message) so nothing has to wait for a batch to fill up
+    or get silently bundled with others. Same underlying data and
+    visual language as format_single_pair_report (bulleted
+    Indicator/Concept Performance, Futures Metrics when relevant, a
+    full trade plan when tradeable) with a "#N" serial number added so
+    a long Full Analysis run stays easy to follow pair by pair.
+    """
+    pair = result.get("symbol", "?")
+    scope_label = SCOPE_LABELS.get(result.get("exchange"), result.get("exchange", "?"))
+    change24h = result.get("change24h")
+    change_arrow = ""
+    if isinstance(change24h, (int, float)):
+        change_arrow = "🔺" if change24h > 0 else ("🔻" if change24h < 0 else "▪️")
+    change_str = f"{change_arrow} {change24h:+.2f}%" if isinstance(change24h, (int, float)) else "N/A"
+    tradeable = result.get("tradeable", False)
+    confidence = result.get("multiTimeframe", {}).get("combinedConfidence", 0)
+
+    lines = [
+        f"📄 *Full Analysis #{index}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair name: `{pair}` ({scope_label})",
+        f"24H %: {change_str}",
+        "",
+        "📊 *Indicator Performance*",
+        _bullet_votes(result.get("indicatorVotes"), result.get("indicatorInfo", "N/A")),
+        "",
+        "🧩 *Concept Performance*",
+        _bullet_votes(result.get("conceptVotes"), result.get("conceptInfo", "N/A")),
+        "",
+        "📈 *Order Flow Information*",
+        f"  {result.get('orderFlowInfo', 'N/A')}",
+    ]
+
+    funding_info = result.get("fundingRateInfo")
+    oi_info = result.get("openInterestInfo")
+    if funding_info and "spot pair" not in funding_info:
+        lines += ["", "💹 *Futures Metrics*", f"  • {funding_info}"]
+        if oi_info:
+            lines.append(f"  • {oi_info}")
+
+    lines += ["", "━━━━━━━━━━━━━━━━━━━━"]
+    if tradeable:
+        verdict = result.get("verdict", "?")
+        lines += [
+            f"{_verdict_emoji(verdict)} *Executed trade: Yes*",
+            f"Trading: *{verdict}*",
+            f"Confidence level: *{confidence:.0f}/100*",
+            f"{_send_time_line()}",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"{_trade_plan_block(result, wallet_balance, mm_cfg)}",
+        ]
+    else:
+        lines += [
+            "❌ *Executed trade: No*",
+            f"Reason: _{result.get('reason', 'N/A')}_",
+            f"Confidence level: *{confidence:.0f}/100*",
+        ]
+
+    return "\n".join(lines)
+
+
+def format_single_pair_report(result: dict, wallet_balance: float | None = None, mm_cfg: dict | None = None,
+                               trade_id: str | None = None) -> str:
     """
     Full report for one pair from engine.signal_scanner.analyze_one_pair()
     - the same pipeline every scan uses, so this is a trustworthy
@@ -753,6 +965,10 @@ def format_single_pair_report(result: dict, wallet_balance: float | None = None,
             f"{_verdict_emoji(verdict)} *Executed Trade: {verdict}*",
             f"Confidence: *{confidence:.0f}/100*",
             f"{_send_time_line()}",
+        ]
+        if trade_id:
+            lines.append(f"Trade ID : `{trade_id}`")
+        lines += [
             "━━━━━━━━━━━━━━━━━━━━",
             f"{_trade_plan_block(result, wallet_balance, mm_cfg)}",
         ]
@@ -951,3 +1167,206 @@ def _status_signal_block(sig: dict) -> str:
     conf = sig.get("confidence")
     conf_str = f"{conf:.0f}/100" if isinstance(conf, (int, float)) else "N/A"
     return f"{_verdict_emoji(sig['verdict'])} *{sig['verdict']}* — `{sig['symbol']}` ({scope_label}, {conf_str}) — {_ago(sig['ts'])}"
+
+# =========================================================================
+# --- Trade Information/Active (Trade ID system) ---
+# Replaces the old "Signal Outcomes" button. See bot/handlers/
+# trade_information.py for the full flow. Every signal now carries a
+# Trade ID; nothing is tracked until the person activates that ID here.
+# =========================================================================
+
+def _format_iso_send_time(iso: str) -> str:
+    """Same visual format as _send_time_line() (BDT + UTC together), but for a STORED timestamp (when the signal was originally sent) instead of 'now'."""
+    from datetime import datetime, timedelta
+    dt_utc = datetime.fromisoformat(iso)
+    dt_bdt = dt_utc + timedelta(hours=6)
+    return (
+        f"`{dt_bdt.strftime('%H:%M:%S')} BDT` | `{dt_utc.strftime('%H:%M:%S')} UTC` "
+        f"| Date: `{dt_utc.strftime('%d-%m-%Y')}`"
+    )
+
+
+def format_trade_id_prompt() -> str:
+    return "✅ *Active a Trade*\n\nSend the Trade ID you want to activate (the number shown on the signal itself)."
+
+
+def format_trade_activated(trade: dict) -> str:
+    """'ID : X Found' confirmation right after activation - reprints the original signal block (no Money Management, no repeated Trade ID line since the header already states it)."""
+    confidence = trade.get("confidence")
+    confidence_str = f"{confidence:.0f}/100" if confidence is not None else "N/A"
+    scan_label = trade.get("scanLabel") or "Signal"
+    pair = trade["symbol"]
+    verdict = trade["verdict"]
+    return (
+        f"ID : `{trade['tradeId']}` Found\n\n"
+        f"📡 *{scan_label}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{_verdict_emoji(verdict)} *{verdict}* — `{pair}`\n"
+        f"Confidence: *{confidence_str}*\n"
+        f"Send Time: {_format_iso_send_time(trade['openedAt'])}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Entry: `{_fmt_price(trade.get('entry'))}`\n"
+        f"SL: `{_fmt_price(trade.get('stopLoss'))}`\n"
+        f"TP1: `{_fmt_price(trade.get('tp1'))}`\n"
+        f"TP2: `{_fmt_price(trade.get('tp2'))}`\n"
+        f"TP3: `{_fmt_price(trade.get('tp3'))}`"
+    )
+
+
+def format_active_balance_prompt() -> str:
+    return (
+        "This trade is now being tracked (Entry/SL/TP notifications will come automatically).\n\n"
+        "💰 Want to also *Active Balance* for it? That locks your current Wallet Balance as margin "
+        "for this trade right now, at this pair's real max leverage, and tracks live P/L like a real trade."
+    )
+
+
+def format_active_balance_confirmed(trade: dict, plan: dict, new_balance: float) -> str:
+    return (
+        f"✅ *Active Balance set successful*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Pair          : `{trade['symbol']}` ({trade['verdict']})\n"
+        f"Trade ID      : `{trade['tradeId']}`\n"
+        f"Leverage      : `{plan['leverage']}x`\n"
+        f"Margin Locked : `{plan['balance']:.2f} USDT`\n"
+        f"Position Size : `{plan['positionNotional']:.2f} USDT`  (`{plan['quantity']:.6f}` units)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 Wallet Balance now: *`{new_balance:.2f} USDT`*\n\n"
+        f"_TP/SL notifications for this trade will now include real P/L on this position._"
+    )
+
+
+def format_active_balance_error(reason: str) -> str:
+    return f"⚠️ Couldn't *Active Balance*: {reason}\n\nThis trade is still being tracked normally, just without the balance/leverage numbers."
+
+
+def format_active_balance_spot_unsupported() -> str:
+    return format_active_balance_error("this is a Spot pair - leverage-based Active Balance is Futures-only for now.")
+
+
+def format_trade_already_active(trade: dict) -> str:
+    return f"ID : `{trade['tradeId']}` — already active, already being tracked for `{trade['symbol']}`."
+
+
+def format_trade_id_not_found(trade_id: str) -> str:
+    return f"ID : `{trade_id}` — not found. Double-check the number and try again."
+
+
+def format_trade_id_bad_input() -> str:
+    return "That doesn't look like a Trade ID. Please send just the number, e.g. `984323987`."
+
+
+def format_trade_information_summary(stats: dict) -> str:
+    return (
+        f"📈 *Trade Information*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Total Active Trade — *{stats['totalActive']}*\n"
+        f"Touch Entry — *{stats['touchEntry']}*\n"
+        f"Touch SL — *{stats['touchSl']}*\n"
+        f"Touch TP-1 — *{stats['touchTp1']}*\n"
+        f"Touch TP-2 — *{stats['touchTp2']}*\n"
+        f"Touch TP-3 — *{stats['touchTp3']}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Tp-1 revers Sl — *{stats['tp1RefersSl']}*\n"
+        f"Tp-2 revers Sl — *{stats['tp2RefersSl']}*\n"
+        f"Tp-3 revers Sl — *{stats['tp3RefersSl']}*"
+    )
+
+
+def _trade_overall_status_label(trade: dict) -> str:
+    if trade["entryStatus"] != "arrived":
+        return "⏳ Waiting Entry"
+    if trade["status"] == "sl_hit":
+        if trade["highestTpHit"] > 0:
+            return f"📉 Down (after TP{trade['highestTpHit']})"
+        return "🛑 Closed (Stop Loss)"
+    if trade["status"] == "tp3_hit":
+        return "🎯 Closed (Full Target)"
+    return "🟢 Active — In Trade"
+
+
+def _level_line(label: str, price, touched: bool) -> str | None:
+    if price is None:
+        return None
+    mark = "✅ Touched" if touched else "⏳ Not yet"
+    return f"{label}: `{_fmt_price(price)}` — {mark}"
+
+
+def format_trade_detail_block(trade: dict, live_price: float | None = None) -> str:
+    """
+    One trade's full status card - used by both 'See Last 12 Trade'
+    (joined several together) and 'See Active Trade By ID' (one alone).
+    Per-level lines show whether that level's been touched; the
+    "pair health" line at the bottom is the trade's overall status
+    (Waiting Entry / Active / Down / Closed).
+
+    `live_price`, when given for a "List with Balance" trade whose
+    entry has already arrived, adds a live/floating P/L line - the
+    "like a real trade, show current profit if market goes up" view.
+    """
+    confidence = trade.get("confidence")
+    confidence_str = f"{confidence:.0f}/100" if confidence is not None else "N/A"
+    scan_label = trade.get("scanLabel") or "Signal"
+    pair = trade["symbol"]
+    verdict = trade["verdict"]
+    entry_arrived = trade["entryStatus"] == "arrived"
+    highest = trade["highestTpHit"]
+    sl_touched = trade["status"] == "sl_hit"
+
+    lines = [
+        f"📡 *{scan_label}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"{_verdict_emoji(verdict)} *{verdict}* — `{pair}`",
+        f"Confidence: *{confidence_str}*",
+        f"Send Time: {_format_iso_send_time(trade['openedAt'])}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        _level_line("Entry", trade.get("entry"), entry_arrived),
+        _level_line("SL", trade.get("stopLoss"), sl_touched),
+        _level_line("TP1", trade.get("tp1"), highest >= 1),
+        _level_line("TP2", trade.get("tp2"), highest >= 2),
+        _level_line("TP3", trade.get("tp3"), highest >= 3),
+        "--------------------------------------------------------------",
+        f"Pair health: {_trade_overall_status_label(trade)}",
+        f"Trade ID : `{trade['tradeId']}`",
+    ]
+
+    if trade.get("balanceMode") == "list_with_balance":
+        lines.append(f"Leverage: `{trade['leverageUsed']}x`  |  Margin Locked: `{trade['marginLocked']:.2f} USDT`")
+        if entry_arrived and live_price is not None:
+            from engine.risk_manager import pnl_at_price
+            usdt, pct = pnl_at_price(trade["positionNotional"], trade["entry"], trade["marginLocked"], verdict, live_price)
+            if usdt is not None:
+                sign = "+" if usdt >= 0 else ""
+                lines.append(f"Live P/L (at `{_fmt_price(live_price)}`): `{sign}{usdt:.2f} USDT` ({sign}{pct:.1f}%)")
+
+    return "\n".join(line for line in lines if line is not None)
+
+
+def format_last_trades_list(trades: list) -> str:
+    if not trades:
+        return "No activated trades yet - use *Active a Trade* first."
+    blocks = [format_trade_detail_block(t) for t in trades]
+    return "\n\n".join(blocks)
+
+
+def format_trade_by_id_prompt() -> str:
+    return "🔍 *See Active Trade By ID*\n\nSend the Trade ID you want to check."
+
+
+def format_trade_by_id_not_found(trade_id: str) -> str:
+    return (
+        f"ID : `{trade_id}` — not found among your last 12 activated trades. "
+        f"It may not have been activated, or it's already rolled off the list."
+    )
+
+
+def format_remove_trade_prompt() -> str:
+    return "🗑 *Remove Trade*\n\nSend the Trade ID you want to remove."
+
+
+def format_trade_removed(trade_id: str) -> str:
+    return f"ID : `{trade_id}` — removed. It's stopped being tracked and won't appear in Trade Information anymore."
+
+
+def format_trade_remove_not_found(trade_id: str) -> str:
+    return f"ID : `{trade_id}` — not found among your last 12 activated trades, nothing removed."

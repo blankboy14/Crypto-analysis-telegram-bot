@@ -13,7 +13,6 @@ from telegram.ext import ContextTypes
 from bot import state_store
 from bot.formatters import (
     format_market_analyse_status, format_strong_signal_status, format_search_signal_status,
-    format_signal_outcomes_status,
 )
 
 log = logging.getLogger("crypto-telegram-bot")
@@ -38,8 +37,3 @@ async def handle_search_signal_status(update: Update, context: ContextTypes.DEFA
     chat_id = update.effective_chat.id
     status = state_store.get_search_signal_status(chat_id)
     await update.message.reply_text(format_search_signal_status(status), parse_mode="Markdown")
-
-async def handle_signal_outcomes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    stats = state_store.get_signal_outcome_stats(chat_id)
-    await update.message.reply_text(format_signal_outcomes_status(stats), parse_mode="Markdown")

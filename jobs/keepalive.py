@@ -48,6 +48,9 @@ import requests
 
 log = logging.getLogger("crypto-telegram-bot")
 
+# Shared state the dashboard reads from. Plain dict + GIL is fine here:
+# one writer thread (the loop below), any number of readers (HTTP
+# handler threads), and every individual assignment is atomic.
 _state = {
     "last_check_at": None,
     "last_check_ok": None,
@@ -65,13 +68,66 @@ def get_state() -> dict:
     return dict(_state)
 
 
-def _send_telegram(token: str, chat_id: int, text: str) -> None:
+KEEPALIVE_MESSAGE_TTL_SECONDS = 30  # how long an automatic keep-alive push stays visible before auto-deleting
+
+
+def _build_keepalive_text(now, next_at, ok, error_text) -> str:
+    """Factored out so both the automatic push (_loop, below) and the on-demand '🖥 Server Information' -> 'Keep-Alive Status' button (bot/handlers/server_information.py) show identical text."""
+    emoji = "✅" if ok else "⚠️"
+    lines = [
+        f"{emoji} *Keep-Alive Check*",
+        f"🕐 Checked: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        f"⏭ Next check: {next_at.strftime('%H:%M:%S')} UTC",
+        f"🌐 Render service: {'awake' if ok else 'NOT responding'}",
+    ]
+    if not ok:
+        lines.append(f"Error: {error_text[:150]}")
+    return "\n".join(lines)
+
+
+def build_keepalive_text_from_state() -> str | None:
+    """
+    Same text as _build_keepalive_text(), but read from the last
+    completed check in `_state` instead of a check that just happened
+    - what the on-demand 'Keep-Alive Status' button shows (it doesn't
+    force a fresh ping, just reports the most recent one, same as the
+    web dashboard already does). Returns None if no check has run yet.
+    """
+    if _state["last_check_at"] is None:
+        return None
+    return _build_keepalive_text(
+        _state["last_check_at"], _state["next_check_at"], _state["last_check_ok"], "",
+    )
+
+
+def _delete_telegram(token: str, chat_id: int, message_id: int) -> None:
     try:
         requests.post(
+            f"https://api.telegram.org/bot{token}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+            timeout=10,
+        )
+    except Exception:
+        pass  # already deleted/too old/etc - never worth erroring over
+
+
+def _send_telegram(token: str, chat_id: int, text: str) -> None:
+    try:
+        resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
             timeout=10,
         )
+        message_id = resp.json().get("result", {}).get("message_id")
+        if message_id:
+            # This still pushes every ~10 minutes (proof the loop
+            # itself is alive and on schedule) - it just no longer
+            # sits in the chat forever. threading.Timer here (not
+            # time.sleep) so it doesn't delay this thread's next check
+            # by KEEPALIVE_MESSAGE_TTL_SECONDS every single cycle.
+            threading.Timer(
+                KEEPALIVE_MESSAGE_TTL_SECONDS, _delete_telegram, args=(token, chat_id, message_id),
+            ).start()
     except Exception:
         log.error("Keepalive: failed to send Telegram notification", exc_info=True)
 
@@ -101,21 +157,18 @@ def _loop(public_url, interval_minutes, bot_token, chat_id, notify) -> None:
         _state["next_check_at"] = next_at
 
         if notify and bot_token and chat_id:
-            emoji = "✅" if ok else "⚠️"
-            lines = [
-                f"{emoji} *Keep-Alive Check*",
-                f"🕐 Checked: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
-                f"⏭ Next check: {next_at.strftime('%H:%M:%S')} UTC",
-                f"🌐 Render service: {'awake' if ok else 'NOT responding'}",
-            ]
-            if not ok:
-                lines.append(f"Error: {error_text[:150]}")
-            _send_telegram(bot_token, chat_id, "\n".join(lines))
+            _send_telegram(bot_token, chat_id, _build_keepalive_text(now, next_at, ok, error_text))
 
         time.sleep(interval_minutes * 60)
 
 
 def start(public_url=None, interval_minutes=None, bot_token=None, chat_id=None, notify=None) -> None:
+    """
+    Call once from bot/main.py, right after the dashboard/health server
+    starts. Starts a daemon background thread and returns immediately -
+    never blocks, never raises (a misconfigured keep-alive should never
+    stop the bot itself from starting).
+    """
     public_url = public_url or os.getenv("PUBLIC_URL")
     if not public_url:
         log.info("Keepalive not started - set PUBLIC_URL in .env (your Render URL) to enable it.")

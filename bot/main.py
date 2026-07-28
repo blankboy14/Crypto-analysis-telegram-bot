@@ -61,12 +61,13 @@ from bot.keyboards import (
     BTN_MARKET_DETAILS,
     BTN_SEARCH_SIGNAL,
     BTN_SEARCH_SIGNAL_STATUS,
-    BTN_SIGNAL_OUTCOMES,
+    BTN_TRADE_INFORMATION,
     BTN_SINGLE_PAIR_ANALYSE,
     BTN_STRONG_SIGNAL_OFF,
     BTN_STRONG_SIGNAL_ON,
     BTN_STRONG_SIGNAL_STATUS,
     BTN_WALLET_BALANCE,
+    BTN_SERVER_INFORMATION,
 )
 from bot.handlers import (
     help as help_handler,
@@ -74,10 +75,12 @@ from bot.handlers import (
     market_details,
     market_select,
     search_signal,
+    server_information,
     single_pair_analyse,
     start,
     status,
     strong_signal,
+    trade_information,
     wallet_balance,
 )
 from jobs import heartbeat, keepalive, signal_outcome_tracker
@@ -213,10 +216,23 @@ def register_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.Text([BTN_STRONG_SIGNAL_STATUS]), status.handle_strong_signal_status))
     application.add_handler(MessageHandler(filters.Text([BTN_SEARCH_SIGNAL]), search_signal.handle))
     application.add_handler(MessageHandler(filters.Text([BTN_SEARCH_SIGNAL_STATUS]), status.handle_search_signal_status))
-    application.add_handler(MessageHandler(filters.Text([BTN_SIGNAL_OUTCOMES]), status.handle_signal_outcomes))
+    application.add_handler(MessageHandler(filters.Text([BTN_TRADE_INFORMATION]), trade_information.handle))
+    application.add_handler(
+        CallbackQueryHandler(trade_information.handle_menu_choice, pattern=r"^trade_info_menu:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(trade_information.handle_action_choice, pattern=r"^trade_info_action:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(trade_information.handle_balance_mode_choice, pattern=r"^trade_info_balmode:")
+    )
     application.add_handler(MessageHandler(filters.Text([BTN_SINGLE_PAIR_ANALYSE]), single_pair_analyse.handle))
     application.add_handler(MessageHandler(filters.Text([BTN_MARKET_DETAILS]), market_details.handle))
     application.add_handler(MessageHandler(filters.Text([BTN_WALLET_BALANCE]), wallet_balance.handle))
+    application.add_handler(MessageHandler(filters.Text([BTN_SERVER_INFORMATION]), server_information.handle))
+    application.add_handler(
+        CallbackQueryHandler(server_information.handle_choice, pattern=r"^server_info:")
+    )
     application.add_handler(MessageHandler(filters.Text([BTN_HELP]), help_handler.handle))
 
     # Catch-all for free-text typed after a button asks for it - a pair
@@ -233,6 +249,9 @@ def register_handlers(application: Application) -> None:
         await single_pair_analyse.handle_pair_text(update, context)
         await market_details.handle_number_text(update, context)
         await wallet_balance.handle_balance_text(update, context)
+        await trade_information.handle_activate_text(update, context)
+        await trade_information.handle_by_id_text(update, context)
+        await trade_information.handle_remove_text(update, context)
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _text_router))
 
@@ -347,4 +366,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C is the normal, expected way to stop this bot locally -
+        # it isn't a crash. Without this, python-telegram-bot's internal
+        # asyncio shutdown re-raises KeyboardInterrupt on its way out and
+        # prints a big traceback that looks like something broke, even
+        # though the bot already stopped cleanly. This just swaps that
+        # traceback for one plain line.
+        log.info("Bot stopped (Ctrl+C).")

@@ -284,21 +284,24 @@ async def tick(context) -> None:
             mm_cfg = settings.get("money_management", {})
             wallet_bal = state_store.get_wallet_balance(chat_id)
             serial = state_store.next_signal_serial(chat_id, "watcher")
-            text = format_strong_signal(result, serial, wallet_bal, mm_cfg)
+            confidence = result.get("multiTimeframe", {}).get("combinedConfidence", 0)
+            plan = result.get("tradePlan")
+            trade_id = None
+            if plan:
+                trade_id = state_store.record_signal_outcome_tracking(
+                    chat_id, "watcher", result.get("exchange", ""), result.get("rawSymbol", ""),
+                    result.get("symbol", "?"), result.get("verdict", "?"),
+                    plan["entry"], plan["stopLoss"], plan.get("tp1"), plan.get("tp2"), plan.get("tp3"),
+                    confidence=confidence, scan_label=f"Trade Signal #{serial}" if serial is not None else "Trade Signal",
+                )
+            text = format_strong_signal(result, serial, wallet_bal, mm_cfg, trade_id=trade_id)
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
             _last_push[cooldown_key] = now
             state_store.log_signal(
                 chat_id, "watcher", result.get("exchange", ""), result.get("symbol", "?"),
-                result.get("verdict", "?"), result.get("multiTimeframe", {}).get("combinedConfidence", 0),
+                result.get("verdict", "?"), confidence,
                 message_text=text,
             )
-            plan = result.get("tradePlan")
-            if plan:
-                state_store.record_signal_outcome_tracking(
-                    chat_id, "watcher", result.get("exchange", ""), result.get("rawSymbol", ""),
-                    result.get("symbol", "?"), result.get("verdict", "?"),
-                    plan["entry"], plan["stopLoss"], plan.get("tp1"), plan.get("tp2"), plan.get("tp3"),
-                )
         except Exception as exc:
             log.error(f"Strong signal watch: failed to send push to chat {chat_id}: {exc}")
 

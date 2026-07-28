@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import sqlite3
 from datetime import datetime, timezone
 
@@ -192,6 +193,43 @@ def _init_schema() -> None:
             con.execute("ALTER TABLE signal_outcomes ADD COLUMN current_stop REAL")
             con.execute("UPDATE signal_outcomes SET current_stop = stop_loss WHERE current_stop IS NULL")
 
+        # Migration: Trade ID / manual-activation system. Every signal
+        # generated (Search Signal, Find 24/7 Strong Signal, Single
+        # Pair Analyse) now gets a row here immediately with a unique
+        # trade_id, but active stays 0 - jobs/signal_outcome_tracker.py
+        # ignores it entirely until the person actually types that
+        # trade_id into "Active a Trade" (bot/handlers/trade_information.py),
+        # which flips active to 1 and starts real tracking. entry_status
+        # gates SL/TP checking: a freshly-activated trade sits at
+        # 'waiting' until price actually touches its entry level (since
+        # activation can happen long after the signal was generated,
+        # by which point price has usually moved away from entry) -
+        # only once entry_status flips to 'arrived' does SL/TP tracking
+        # begin, walking forward from entry_arrived_at rather than
+        # opened_at.
+        if "trade_id" not in existing_outcome_cols:
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN trade_id TEXT")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN active INTEGER NOT NULL DEFAULT 0")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN entry_status TEXT NOT NULL DEFAULT 'waiting'")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN activated_at TEXT")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN entry_arrived_at TEXT")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN confidence REAL")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN scan_label TEXT")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_outcomes_trade_id ON signal_outcomes (trade_id)")
+
+        # Migration: "List with Balance" - a trade activated this way
+        # locks a slice of the Wallet Balance as margin at that exact
+        # moment (balance_mode/margin_locked/leverage_used/
+        # position_notional/quantity_locked are all set together, only
+        # for that mode - a plain "Only List" trade leaves these NULL
+        # and never touches the wallet balance at all).
+        if "balance_mode" not in existing_outcome_cols:
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN balance_mode TEXT NOT NULL DEFAULT 'list_only'")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN margin_locked REAL")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN leverage_used INTEGER")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN position_notional REAL")
+            con.execute("ALTER TABLE signal_outcomes ADD COLUMN quantity_locked REAL")
+
         # --- Wallet Balance (Money Management add-on) ---
         # A number the user TYPES IN and the bot remembers per chat -
         # NOT a live account balance (this bot has no exchange API key
@@ -301,6 +339,23 @@ def get_wallet_balance(chat_id: int) -> float | None:
             "SELECT balance FROM wallet_balance WHERE chat_id = ?", (chat_id,)
         ).fetchone()
     return row[0] if row else None
+
+
+def adjust_wallet_balance(chat_id: int, delta: float) -> float:
+    """
+    Adds `delta` (positive or negative) to the current saved Wallet
+    Balance - used by "List with Balance" activation (locks margin,
+    delta is negative) and by jobs/signal_outcome_tracker.py crediting
+    a closed live-balance trade's margin + P/L back (delta is margin
+    + realized P/L, which can itself be negative on a loss). Returns
+    the new balance. A chat with no saved balance yet is treated as 0
+    before applying delta, same as get_wallet_balance() returning None
+    is already treated as "no balance" everywhere else.
+    """
+    current = get_wallet_balance(chat_id) or 0.0
+    new_balance = current + delta
+    set_wallet_balance(chat_id, new_balance)
+    return new_balance
 
 
 # --- per-mode ON/OFF (mode is "market_analyse" or "strong_signal") ---
@@ -712,38 +767,210 @@ def get_enabled_indicators() -> dict | None:
 
 # --- Signal Outcome Tracking (jobs/signal_outcome_tracker.py) ---
 
+def _generate_unique_trade_id(con) -> str:
+    """
+    10-digit numeric Trade ID. Drawn from ONE shared pool across every
+    source (Search Signal, Find 24/7 Strong Signal, Single Pair
+    Analyse) rather than one counter per source, so two IDs can never
+    collide with each other no matter where they came from.
+    """
+    for _ in range(50):
+        candidate = str(random.randint(10 ** 9, 10 ** 10 - 1))  # always 10 digits, never leading-zero
+        exists = con.execute("SELECT 1 FROM signal_outcomes WHERE trade_id = ?", (candidate,)).fetchone()
+        if not exists:
+            return candidate
+    raise RuntimeError("Could not generate a unique trade ID after 50 attempts")
+
+
 def record_signal_outcome_tracking(chat_id: int, source: str, scope: str, raw_symbol: str, symbol: str,
                                     verdict: str, entry: float, stop_loss: float,
-                                    tp1: float | None, tp2: float | None, tp3: float | None) -> None:
+                                    tp1: float | None, tp2: float | None, tp3: float | None,
+                                    confidence: float | None = None, scan_label: str | None = None) -> str:
     """
     Called right alongside log_signal() for any signal that had a real
-    trade plan - starts tracking it as "pending" so
-    jobs/signal_outcome_tracker.py picks it up on its next tick and
-    starts checking real price/candle data against these exact levels.
+    trade plan. Unlike before, this no longer starts tracking it right
+    away - it just reserves a unique trade_id and stores the plan with
+    active=0. jobs/signal_outcome_tracker.py ignores it until the
+    person activates that trade_id via "Active a Trade". Returns the
+    trade_id so the caller can print it on the signal message itself.
     """
     with _connect() as con:
+        trade_id = _generate_unique_trade_id(con)
         con.execute(
             "INSERT INTO signal_outcomes "
             "(chat_id, source, scope, raw_symbol, symbol, verdict, entry, stop_loss, current_stop, tp1, tp2, tp3, "
-            "status, highest_tp_hit, opened_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)",
-            (chat_id, source, scope, raw_symbol, symbol, verdict, entry, stop_loss, stop_loss, tp1, tp2, tp3, _now()),
+            "status, highest_tp_hit, opened_at, trade_id, active, entry_status, confidence, scan_label) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, 0, 'waiting', ?, ?)",
+            (chat_id, source, scope, raw_symbol, symbol, verdict, entry, stop_loss, stop_loss, tp1, tp2, tp3,
+             _now(), trade_id, confidence, scan_label),
+        )
+    return trade_id
+
+
+def activate_trade(chat_id: int, trade_id: str) -> dict | None:
+    """
+    "Active a Trade" - looks up trade_id SCOPED TO THIS CHAT (a trade
+    ID from a different chat is never activatable here) and flips it
+    on for the tracker job to start watching. Returns the trade as a
+    dict (with alreadyActive telling the caller whether this call is
+    what just activated it, or it was already active before), or None
+    if no such trade_id exists for this chat at all.
+    """
+    with _connect() as con:
+        row = con.execute(
+            "SELECT id, active, source, scope, raw_symbol, symbol, verdict, entry, stop_loss, tp1, tp2, tp3, "
+            "confidence, scan_label, opened_at, trade_id FROM signal_outcomes WHERE chat_id = ? AND trade_id = ?",
+            (chat_id, trade_id),
+        ).fetchone()
+        if row is None:
+            return None
+        already_active = bool(row[1])
+        if not already_active:
+            con.execute(
+                "UPDATE signal_outcomes SET active = 1, activated_at = ? WHERE id = ?",
+                (_now(), row[0]),
+            )
+    return {
+        "id": row[0], "alreadyActive": already_active, "source": row[2], "scope": row[3], "rawSymbol": row[4],
+        "symbol": row[5], "verdict": row[6], "entry": row[7], "stopLoss": row[8], "tp1": row[9], "tp2": row[10],
+        "tp3": row[11], "confidence": row[12], "scanLabel": row[13], "openedAt": row[14], "tradeId": row[15],
+    }
+
+
+def set_trade_balance_mode(chat_id: int, trade_id: str, margin_locked: float, leverage: int,
+                            position_notional: float, quantity: float) -> bool:
+    """
+    "List with Balance" - locks this trade to a slice of the Wallet
+    Balance at the moment of choosing it (see bot/handlers/
+    trade_information.py). Only ever called right after activate_trade()
+    for a trade that's still 'list_only' - returns False if the trade
+    isn't found for this chat or was already switched to 'list_with_balance'
+    before (so a double-tap on the button can't lock margin twice).
+    """
+    with _connect() as con:
+        cur = con.execute(
+            "UPDATE signal_outcomes SET balance_mode = 'list_with_balance', margin_locked = ?, "
+            "leverage_used = ?, position_notional = ?, quantity_locked = ? "
+            "WHERE chat_id = ? AND trade_id = ? AND balance_mode = 'list_only'",
+            (margin_locked, leverage, position_notional, quantity, chat_id, trade_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_trade_summary(chat_id: int) -> dict:
+    """
+    Counts for the 'Trade Information' button. totalActive only
+    counts trades STILL OPEN (not yet sl_hit/tp3_hit) - a closed trade
+    stops counting as "active" the moment it closes, same moment it
+    drops off "See Last 12 Trade". touchSl / touchTp3 are running
+    historical tallies (every SL/TP3 close ever, including ones that
+    have since rolled off the last-12 list) - they never go back down.
+    The three tpN_reversed_sl counts are a breakdown of touchSl: how
+    many of those SL closes happened AFTER price had already reached
+    TP1 / TP2 / TP3 (a "Down" close, not a clean stop-out). tp3RefersSl
+    will structurally always read 0 under the current settings -
+    reaching TP3 closes a trade immediately as a full win, so there's
+    no further tracking left for it to later reverse into an SL hit.
+    """
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT entry_status, status, highest_tp_hit FROM signal_outcomes WHERE chat_id = ? AND active = 1",
+            (chat_id,),
+        ).fetchall()
+    return {
+        "totalActive": sum(1 for r in rows if r[1] not in ("sl_hit", "tp3_hit")),
+        "touchEntry": sum(1 for r in rows if r[0] == "arrived"),
+        "touchSl": sum(1 for r in rows if r[1] == "sl_hit"),
+        "touchTp1": sum(1 for r in rows if r[2] >= 1),
+        "touchTp2": sum(1 for r in rows if r[2] >= 2),
+        "touchTp3": sum(1 for r in rows if r[2] >= 3),
+        "tp1RefersSl": sum(1 for r in rows if r[1] == "sl_hit" and r[2] == 1),
+        "tp2RefersSl": sum(1 for r in rows if r[1] == "sl_hit" and r[2] == 2),
+        "tp3RefersSl": sum(1 for r in rows if r[1] == "sl_hit" and r[2] == 3),
+    }
+
+
+_TRADE_ROW_COLUMNS = (
+    "id, source, scope, raw_symbol, symbol, verdict, entry, stop_loss, current_stop, tp1, tp2, tp3, "
+    "status, highest_tp_hit, entry_status, confidence, scan_label, opened_at, trade_id, "
+    "balance_mode, margin_locked, leverage_used, position_notional, quantity_locked"
+)
+
+
+def _row_to_trade_dict(r) -> dict:
+    return {
+        "id": r[0], "source": r[1], "scope": r[2], "rawSymbol": r[3], "symbol": r[4], "verdict": r[5],
+        "entry": r[6], "stopLoss": r[7], "currentStop": r[8] if r[8] is not None else r[7],
+        "tp1": r[9], "tp2": r[10], "tp3": r[11], "status": r[12], "highestTpHit": r[13],
+        "entryStatus": r[14], "confidence": r[15], "scanLabel": r[16], "openedAt": r[17], "tradeId": r[18],
+        "balanceMode": r[19], "marginLocked": r[20], "leverageUsed": r[21],
+        "positionNotional": r[22], "quantityLocked": r[23],
+    }
+
+
+def get_last_active_trades(chat_id: int, limit: int = 12) -> list:
+    """
+    'See Last 12 Trade' - most recently activated trades for this chat
+    that are STILL OPEN, newest first. The moment a trade's SL or TP3
+    hits (status becomes 'sl_hit'/'tp3_hit'), it's closed and drops out
+    of this list entirely - it still counts permanently in
+    get_trade_summary()'s touchSl/touchTp3 tallies, it just isn't
+    browsable here anymore.
+    """
+    with _connect() as con:
+        rows = con.execute(
+            f"SELECT {_TRADE_ROW_COLUMNS} FROM signal_outcomes "
+            "WHERE chat_id = ? AND active = 1 AND status NOT IN ('sl_hit', 'tp3_hit') "
+            "ORDER BY activated_at DESC LIMIT ?",
+            (chat_id, limit),
+        ).fetchall()
+    return [_row_to_trade_dict(r) for r in rows]
+
+
+def get_trade_by_id_for_chat(chat_id: int, trade_id: str) -> dict | None:
+    """'See Active Trade By ID' - only matches a trade that's active=1 AND still open for this chat (closed trades, and never-activated trade_ids, won't be found here)."""
+    with _connect() as con:
+        row = con.execute(
+            f"SELECT {_TRADE_ROW_COLUMNS} FROM signal_outcomes "
+            "WHERE chat_id = ? AND trade_id = ? AND active = 1 AND status NOT IN ('sl_hit', 'tp3_hit')",
+            (chat_id, trade_id),
+        ).fetchone()
+    return _row_to_trade_dict(row) if row else None
+
+
+def remove_trade(chat_id: int, trade_id: str) -> bool:
+    """'Remove Trade' - deletes an activated trade outright (stops tracking it, drops it from every Trade Information view). Only ever touches a trade belonging to THIS chat. Returns False if no active trade with that ID exists for this chat."""
+    with _connect() as con:
+        cur = con.execute(
+            "DELETE FROM signal_outcomes WHERE chat_id = ? AND trade_id = ? AND active = 1",
+            (chat_id, trade_id),
+        )
+        return cur.rowcount > 0
+
+
+def mark_entry_arrived(outcome_id: int, arrived_at_iso: str) -> None:
+    with _connect() as con:
+        con.execute(
+            "UPDATE signal_outcomes SET entry_status = 'arrived', entry_arrived_at = ?, last_checked_at = ? "
+            "WHERE id = ?",
+            (arrived_at_iso, _now(), outcome_id),
         )
 
 
 def get_open_signal_outcomes(limit: int = 500) -> list:
     """
-    Every outcome row not yet fully closed (status is 'pending',
-    'tp1_hit', or 'tp2_hit' - NOT 'tp3_hit'/'sl_hit', which are
-    terminal) across ALL chats - this job is global, not per-chat,
-    since it's just catching up on price action for whatever's still
-    open regardless of who it was sent to.
+    Every ACTIVATED outcome row not yet fully closed (status is
+    'pending', 'tp1_hit', or 'tp2_hit' - NOT 'tp3_hit'/'sl_hit', which
+    are terminal) across ALL chats. active = 1 is the key filter now -
+    a signal that was generated but never activated via "Active a
+    Trade" is never picked up here, no matter how long ago it was sent.
     """
     with _connect() as con:
         rows = con.execute(
             "SELECT id, chat_id, source, scope, raw_symbol, symbol, verdict, entry, stop_loss, current_stop, "
-            "tp1, tp2, tp3, status, highest_tp_hit, opened_at FROM signal_outcomes "
-            "WHERE status NOT IN ('tp3_hit', 'sl_hit') ORDER BY opened_at ASC LIMIT ?",
+            "tp1, tp2, tp3, status, highest_tp_hit, opened_at, trade_id, entry_status, activated_at, "
+            "entry_arrived_at, balance_mode, margin_locked, leverage_used, position_notional FROM signal_outcomes "
+            "WHERE active = 1 AND status NOT IN ('tp3_hit', 'sl_hit') ORDER BY opened_at ASC LIMIT ?",
             (limit,),
         ).fetchall()
     return [
@@ -751,6 +978,8 @@ def get_open_signal_outcomes(limit: int = 500) -> list:
             "id": r[0], "chatId": r[1], "source": r[2], "scope": r[3], "rawSymbol": r[4], "symbol": r[5],
             "verdict": r[6], "entry": r[7], "stopLoss": r[8], "currentStop": r[9] if r[9] is not None else r[8],
             "tp1": r[10], "tp2": r[11], "tp3": r[12], "status": r[13], "highestTpHit": r[14], "openedAt": r[15],
+            "tradeId": r[16], "entryStatus": r[17], "activatedAt": r[18], "entryArrivedAt": r[19],
+            "balanceMode": r[20], "marginLocked": r[21], "leverageUsed": r[22], "positionNotional": r[23],
         }
         for r in rows
     ]
