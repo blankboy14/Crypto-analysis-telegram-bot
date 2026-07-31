@@ -55,6 +55,7 @@ from telegram.ext import (
 
 from bot.keyboards import (
     BTN_HELP,
+    BTN_CLEAN_CHAT,
     BTN_MARKET_ANALYSE_OFF,
     BTN_MARKET_ANALYSE_ON,
     BTN_MARKET_ANALYSE_STATUS,
@@ -70,6 +71,7 @@ from bot.keyboards import (
     BTN_SERVER_INFORMATION,
 )
 from bot.handlers import (
+    clean_chat,
     help as help_handler,
     market_analyse,
     market_details,
@@ -83,6 +85,7 @@ from bot.handlers import (
     trade_information,
     wallet_balance,
 )
+from bot.message_tracker import TrackingBot, track_incoming
 from jobs import heartbeat, keepalive, signal_outcome_tracker
 from web.dashboard import start_dashboard_server
 
@@ -233,7 +236,16 @@ def register_handlers(application: Application) -> None:
     application.add_handler(
         CallbackQueryHandler(server_information.handle_choice, pattern=r"^server_info:")
     )
+    application.add_handler(MessageHandler(filters.Text([BTN_CLEAN_CHAT]), clean_chat.handle))
     application.add_handler(MessageHandler(filters.Text([BTN_HELP]), help_handler.handle))
+
+    # message_tracker.track_incoming (see bot/message_tracker.py) - runs
+    # in its own early group (-1) so it records every single incoming
+    # message_id before any button/text handler above even looks at the
+    # update, regardless of which one (if any) ends up handling it. This
+    # is what lets "🧹 Clean Chat" find the user's own messages, not just
+    # the bot's.
+    application.add_handler(MessageHandler(filters.ALL, track_incoming), group=-1)
 
     # Catch-all for free-text typed after a button asks for it - a pair
     # name (Single Pair Analyse), a "how many pairs" number (Market
@@ -274,7 +286,13 @@ def build_application(settings: dict) -> Application:
     # per-chat (it just checks whatever's still open in signal_outcomes
     # across every chat), so it's scheduled once, right here, and runs
     # regardless of any chat's own 24/7 toggle state.
-    application = Application.builder().token(token).rate_limiter(AIORateLimiter()).build()
+    #
+    # Built on TrackingBot (bot/message_tracker.py) instead of the
+    # default ExtBot, purely so "🧹 Clean Chat" can find every message
+    # the bot ever sent - everything else (rate limiting included)
+    # behaves exactly the same as before.
+    bot = TrackingBot(token=token, rate_limiter=AIORateLimiter())
+    application = Application.builder().bot(bot).build()
     application.bot_data["settings"] = settings
 
     outcome_cfg = settings.get("signal_outcome_tracker", {})

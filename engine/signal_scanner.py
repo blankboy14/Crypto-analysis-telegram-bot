@@ -706,17 +706,30 @@ def scan_market(market, enabled_indicators, enabled_concepts, worker_count=8,
     }
 
 
-def scan_market_above_confidence(market, min_confidence, enabled_indicators, enabled_concepts, worker_count=8):
+def scan_market_above_confidence(market, min_confidence, enabled_indicators, enabled_concepts, worker_count=8,
+                                  weak_confidence_ceiling=None):
     """
     Same as scan_market(), but for the 24/7 "Find Strong Signal" watcher
     (Phase 2.2): only pairs whose combinedConfidence is >= min_confidence
     (spec calls for an 80+ floor) are returned - the watcher pushes every
     one of these to active users, not just a top-3 shortlist, since the
     whole point of that mode is "don't miss a high-conviction setup".
+
+    `weak_confidence_ceiling`, when given, ALSO returns every tradeable
+    pair scoring BELOW it as "weak" - free, since scan_market() already
+    evaluated every pair regardless; this is what
+    jobs/strong_signal_watcher.py's Early Momentum Watch re-checks on
+    its own faster schedule (see that module for why).
     """
     scan = scan_market(market, enabled_indicators, enabled_concepts, worker_count=worker_count)
     strong = [
         r for r in scan["tradeable"]
         if r.get("multiTimeframe", {}).get("combinedConfidence", 0) >= min_confidence
     ]
-    return {"strong": strong, "scanned": scan["scanned"]}
+    result = {"strong": strong, "scanned": scan["scanned"]}
+    if weak_confidence_ceiling is not None:
+        result["weak"] = [
+            r for r in scan["tradeable"]
+            if r.get("multiTimeframe", {}).get("combinedConfidence", 0) < weak_confidence_ceiling
+        ]
+    return result

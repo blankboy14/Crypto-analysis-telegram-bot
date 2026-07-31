@@ -15,7 +15,7 @@
 # whole process's health, not any one chat's own toggles.
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from telegram.ext import ContextTypes
 
@@ -56,6 +56,7 @@ def build_heartbeat_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     """
     settings = context.bot_data.get("settings", {})
     now = datetime.now(timezone.utc)
+    now_bdt = now + timedelta(hours=6)
 
     outcome_cfg = settings.get("signal_outcome_tracker", {})
     outcome_tracker_on = outcome_cfg.get("enabled", True)
@@ -67,7 +68,7 @@ def build_heartbeat_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     lines = [
         "💓 *Bot Heartbeat — Still Alive!*",
         "━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🕐 *Time:* {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        f"🕐 *Time:* {now_bdt.strftime('%H:%M:%S')} BDT | {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
         f"⏱ *Uptime since last restart:* {_format_uptime()}",
         "",
         "*✅ 24/7 Systems Currently Running:*",

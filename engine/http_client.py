@@ -8,8 +8,23 @@ import logging
 import requests
 from requests.adapters import HTTPAdapter
 
-http_session = requests.Session()
 log = logging.getLogger("crypto-analyzer-http")
+
+http_session = requests.Session()
+
+# Pin TLS verification to the CA bundle that ships with THIS install of
+# certifi, instead of leaving verify=True (the requests default).
+# requests only falls back to the REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE
+# env vars when verify is True/None - so if the host machine has one of
+# those set to a stale path (e.g. an old/moved .venv), every request
+# fails with "Could not find a suitable TLS CA certificate bundle" even
+# though a perfectly good cert bundle is installed right here. Pinning
+# verify to an explicit path bypasses that env var lookup entirely.
+try:
+    import certifi
+    http_session.verify = certifi.where()
+except Exception as exc:
+    log.error(f"Could not pin certifi CA bundle, falling back to default TLS verification: {exc}")
 
 # The default HTTPAdapter pool only holds 10 connections. The indicator
 # batch sweep (http_server.py, BATCH_WORKER_COUNT) runs 10 concurrent

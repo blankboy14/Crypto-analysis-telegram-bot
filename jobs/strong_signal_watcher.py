@@ -38,7 +38,7 @@ from engine.signal_scanner import MARKET_SCOPE_MAP, scan_market_above_confidence
 from engine.bitget_api import get_token_list
 from engine.order_flow import get_order_flow
 from bot import state_store
-from bot.formatters import format_strong_signal, format_pump_reversal_alert
+from bot.formatters import format_strong_signal, format_pump_reversal_alert, format_early_momentum_alert
 from bot.scan_executor import SCAN_EXECUTOR
 
 log = logging.getLogger("crypto-telegram-bot")
@@ -49,6 +49,12 @@ MODE = "strong_signal"
 
 # market ("spot"/"future"/"both") -> {"result": <scan_market_above_confidence() output>, "ts": <unix ts>}
 _scan_cache: dict = {}
+
+# market -> {scope: set(rawSymbol)} - every pair below weak_confidence_ceiling
+# from the LAST full scan, grouped by underlying scope ("bitget-spot"/
+# "bitget-futures") since MARKET_SCOPE_MAP["both"] covers two scopes at
+# once. Read by early_watch_tick() - see that function + module docstring.
+_weak_tier_cache: dict = {}
 
 # market -> asyncio.Lock, created lazily on first use (can't create
 # real asyncio.Lock objects at import time outside a running loop in
@@ -155,6 +161,11 @@ def _run_pump_reversal_check(scopes: list, cfg: dict) -> list:
                 "scope": scope, "rawSymbol": raw_symbol, "symbol": symbol,
                 "cumulativePct": ov["cumulativePct"], "peakPrice": peak,
                 "currentPrice": current_price, "dropPct": drop_pct, "sellPct": sell_pct,
+                "entry": current_price,
+                "stopLoss": peak * (1 + cfg.get("pump_reversal_sl_buffer_above_peak_pct", 3.0) / 100),
+                "tp1": current_price * (1 - cfg.get("pump_reversal_tp1_pct", 5.0) / 100),
+                "tp2": current_price * (1 - cfg.get("pump_reversal_tp2_pct", 10.0) / 100),
+                "tp3": current_price * (1 - cfg.get("pump_reversal_tp3_pct", 15.0) / 100),
             })
             state_store.resolve_overextended(scope, raw_symbol)
 
@@ -190,12 +201,17 @@ def _get_lock(market: str) -> asyncio.Lock:
     return lock
 
 
-async def _get_or_run_scan(market: str, min_confidence: float, enabled_indicators, worker_count: int, max_age_seconds: float) -> dict:
+async def _get_or_run_scan(market: str, min_confidence: float, enabled_indicators, worker_count: int,
+                            max_age_seconds: float, weak_confidence_ceiling: float | None = None) -> dict:
     """
     Returns a fresh-enough scan_market_above_confidence() result for
     `market`, reusing the cached one if it's still within
     `max_age_seconds`, otherwise running exactly one new scan (never
     more than one concurrently per market - see module docstring).
+
+    Also updates _weak_tier_cache for `market` every time a scan
+    actually runs (not on a cache hit) - this is the ONLY place the
+    weak tier gets refreshed; early_watch_tick() only ever READS it.
     """
     cached = _scan_cache.get(market)
     now = time.time()
@@ -215,9 +231,16 @@ async def _get_or_run_scan(market: str, min_confidence: float, enabled_indicator
         result = await loop.run_in_executor(
             SCAN_EXECUTOR,
             scan_market_above_confidence,
-            market, min_confidence, enabled_indicators, None, worker_count,
+            market, min_confidence, enabled_indicators, None, worker_count, weak_confidence_ceiling,
         )
         _scan_cache[market] = {"result": result, "ts": time.time()}
+
+        if weak_confidence_ceiling is not None:
+            by_scope: dict = {}
+            for r in result.get("weak", []):
+                by_scope.setdefault(r.get("exchange"), set()).add(r.get("rawSymbol"))
+            _weak_tier_cache[market] = by_scope
+
         return result
 
 
@@ -245,11 +268,14 @@ async def tick(context) -> None:
     worker_count = cfg.get("worker_count", 8)
     cooldown_seconds = cfg.get("cooldown_seconds", 3600)
     scan_interval = cfg.get("scan_interval_seconds", 900)
+    weak_confidence_ceiling = cfg.get("weak_confidence_ceiling")
 
     enabled_indicators = state_store.get_enabled_indicators()
 
     try:
-        scan = await _get_or_run_scan(market, min_confidence, enabled_indicators, worker_count, scan_interval)
+        scan = await _get_or_run_scan(
+            market, min_confidence, enabled_indicators, worker_count, scan_interval, weak_confidence_ceiling,
+        )
     except Exception as exc:
         log.error(f"Strong signal watch: scan failed for chat {chat_id} (market={market}): {exc}")
         state_store.log_scan(chat_id, "watcher", market, "failed", error=str(exc))
@@ -320,10 +346,17 @@ async def tick(context) -> None:
             continue
 
         try:
+            trade_id = state_store.record_signal_outcome_tracking(
+                chat_id, "watcher", event["scope"], event["rawSymbol"], event["symbol"], "SELL",
+                event["entry"], event["stopLoss"], event.get("tp1"), event.get("tp2"), event.get("tp3"),
+                scan_label="Pump Reversal",
+            )
             text = format_pump_reversal_alert(
                 pair=event["symbol"], market=market, cumulative_pct=event["cumulativePct"],
                 peak_price=event["peakPrice"], current_price=event["currentPrice"],
                 drop_pct=event["dropPct"], sell_pct=event["sellPct"],
+                entry=event["entry"], stop_loss=event["stopLoss"],
+                tp1=event.get("tp1"), tp2=event.get("tp2"), tp3=event.get("tp3"), trade_id=trade_id,
             )
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
             _last_pump_push[cooldown_key] = now
@@ -332,3 +365,140 @@ async def tick(context) -> None:
             )
         except Exception as exc:
             log.error(f"Pump reversal watch: failed to send push to chat {chat_id}: {exc}")
+
+# =========================================================================
+# --- Early Momentum Watch (point 2 of the "Find 24/7 Strong Signal"
+# upgrade) ---
+# Scheduled as its OWN job.queue.run_repeating (see
+# bot/handlers/strong_signal.py), on early_watch_interval_seconds
+# (default 4 min) - genuinely independent of the main tick()'s own
+# scan_interval_seconds (default 5 min), not just a cache-freshness
+# window inside the same callback. Only examines pairs _weak_tier_cache
+# flagged as below weak_confidence_ceiling on the LAST full scan - cheap
+# ticker-price sampling only, no candles/indicators/order-flow, so
+# running it far more often than the full scan costs almost nothing.
+# =========================================================================
+
+_early_watch_price_history: dict = {}   # (scope, rawSymbol) -> [(ts, price), ...]
+_last_early_watch_push: dict = {}       # (chat_id, rawSymbol) -> unix ts, own cooldown
+
+
+def _prune_price_history(history: list, now: float, max_age: float) -> None:
+    cutoff = now - max_age
+    i = 0
+    while i < len(history) and history[i][0] < cutoff:
+        i += 1
+    if i:
+        del history[:i]
+
+
+def _closest_price_at_age(history: list, now: float, target_age: float):
+    """Same 'closest sample to target_age' idea used elsewhere in this codebase (see volume_spike_watcher.py's _find_closest_with_ts) - a tick isn't guaranteed to land exactly target_age seconds after any given sample."""
+    candidates = [(abs((now - ts) - target_age), price) for ts, price in history if now - ts >= target_age * 0.5]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    return candidates[0][1]
+
+
+def _run_early_momentum_check(scopes: list, weak_by_scope: dict, cfg: dict) -> list:
+    """
+    For every pair _weak_tier_cache flagged as weak for its scope,
+    records a price sample and checks whether it's moved
+    early_watch_move_pct_threshold% or more since the closest sample
+    to early_watch_lookback_seconds ago. No weak-tier data for a scope
+    yet (e.g. right after a restart, before the first full scan
+    completes) just means nothing is checked for it this tick - not
+    an error, the full scan will populate it soon.
+    """
+    lookback_seconds = cfg.get("early_watch_lookback_seconds", 900)
+    move_pct_threshold = cfg.get("early_watch_move_pct_threshold", 6.0)
+    max_history_age = lookback_seconds * 2
+
+    events = []
+    now = time.time()
+    for scope in scopes:
+        weak_symbols = weak_by_scope.get(scope)
+        if not weak_symbols:
+            continue
+        try:
+            tokens = get_token_list(scope)["tokens"]
+        except Exception as exc:
+            log.error(f"Early momentum watch: token list fetch failed for {scope}: {exc}")
+            continue
+
+        for token in tokens:
+            raw_symbol = token["rawSymbol"]
+            if raw_symbol not in weak_symbols:
+                continue
+            price = token.get("lastPrice")
+            if not price:
+                continue
+
+            key = (scope, raw_symbol)
+            history = _early_watch_price_history.setdefault(key, [])
+            _prune_price_history(history, now, max_history_age)
+
+            baseline = _closest_price_at_age(history, now, lookback_seconds)
+            history.append((now, price))
+
+            if baseline and baseline > 0:
+                pct_change = (price - baseline) / baseline * 100
+                if abs(pct_change) >= move_pct_threshold:
+                    events.append({
+                        "scope": scope, "rawSymbol": raw_symbol, "symbol": token["symbol"],
+                        "lastPrice": price, "pctChange": pct_change,
+                        "direction": "up" if pct_change >= 0 else "down",
+                    })
+
+    return events
+
+
+async def early_watch_tick(context) -> None:
+    """
+    The job_queue.run_repeating callback for the Early Momentum Watch -
+    a SEPARATE job from tick() above, its own faster interval. Self-
+    heals the same way tick() does if the mode got turned off.
+    """
+    job = context.job
+    chat_id = job.chat_id
+    market = (job.data or {}).get("market")
+
+    if not state_store.is_mode_on(chat_id, MODE):
+        job.schedule_removal()
+        return
+    if market not in MARKET_SCOPE_MAP:
+        job.schedule_removal()
+        return
+
+    settings = context.bot_data.get("settings", {})
+    cfg = settings.get("strong_signal_watch", {})
+    cooldown_seconds = cfg.get("early_watch_cooldown_seconds", 1800)
+    lookback_seconds = cfg.get("early_watch_lookback_seconds", 900)
+
+    scopes = MARKET_SCOPE_MAP[market]
+    weak_by_scope = _weak_tier_cache.get(market, {})
+
+    try:
+        loop = asyncio.get_running_loop()
+        events = await loop.run_in_executor(SCAN_EXECUTOR, _run_early_momentum_check, scopes, weak_by_scope, cfg)
+    except Exception as exc:
+        log.error(f"Early momentum watch: check failed for chat {chat_id} (market={market}): {exc}")
+        return
+
+    now = time.time()
+    for event in events:
+        cooldown_key = (chat_id, event["rawSymbol"])
+        last = _last_early_watch_push.get(cooldown_key, 0)
+        if now - last < cooldown_seconds:
+            continue
+
+        try:
+            text = format_early_momentum_alert(
+                pair=event["symbol"], market=market, last_price=event["lastPrice"],
+                pct_change=event["pctChange"], direction=event["direction"], lookback_seconds=lookback_seconds,
+            )
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            _last_early_watch_push[cooldown_key] = now
+        except Exception as exc:
+            log.error(f"Early momentum watch: failed to send push to chat {chat_id}: {exc}")

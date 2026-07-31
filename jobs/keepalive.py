@@ -74,10 +74,12 @@ KEEPALIVE_MESSAGE_TTL_SECONDS = 30  # how long an automatic keep-alive push stay
 def _build_keepalive_text(now, next_at, ok, error_text) -> str:
     """Factored out so both the automatic push (_loop, below) and the on-demand '🖥 Server Information' -> 'Keep-Alive Status' button (bot/handlers/server_information.py) show identical text."""
     emoji = "✅" if ok else "⚠️"
+    now_bdt = now + timedelta(hours=6)
+    next_at_bdt = next_at + timedelta(hours=6)
     lines = [
         f"{emoji} *Keep-Alive Check*",
-        f"🕐 Checked: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
-        f"⏭ Next check: {next_at.strftime('%H:%M:%S')} UTC",
+        f"🕐 Checked: {now_bdt.strftime('%H:%M:%S')} BDT | {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        f"⏭ Next check: {next_at_bdt.strftime('%H:%M:%S')} BDT | {next_at.strftime('%H:%M:%S')} UTC",
         f"🌐 Render service: {'awake' if ok else 'NOT responding'}",
     ]
     if not ok:

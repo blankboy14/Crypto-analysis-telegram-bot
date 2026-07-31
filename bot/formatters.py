@@ -124,24 +124,89 @@ def _fmt_usdt(value: float) -> str:
 
 
 def format_absolute_volume_alert(pair: str, last_price: float, interval_volume: float,
-                                  window_seconds: float, threshold_usdt: float, market: str) -> str:
+                                  window_seconds: float, threshold_usdt: float, market: str,
+                                  direction: str = "up", price_window_pct_change: float | None = None,
+                                  change_24h: float | None = None, is_main: bool = False,
+                                  trend: dict | None = None) -> str:
     """
     24/7 Market Analyse add-on #1 - a pair's traded volume just crossed
     a fixed absolute USDT bar within a rolling window (e.g. 60M+ within
     30 minutes), regardless of whether that's unusual for this
     particular pair or not.
+
+    `direction`/`price_window_pct_change` say whether that money pushed
+    price UP or DOWN over the window - "a lot of money moved" alone
+    doesn't say which way. `change_24h` and `trend` (30m/1h/4h/1D %
+    moves, each from that timeframe's own latest candle) give the
+    fuller picture of what's actually been happening on this pair,
+    not just this one window.
     """
     window_minutes = window_seconds / 60
+    direction_label = "🟢 UP" if direction == "up" else "🔴 DOWN"
+    tier_label = "Main Coin" if is_main else "Meme/Alt Coin"
+
+    def _pct_str(pct):
+        if pct is None:
+            return "N/A"
+        sign = "+" if pct >= 0 else ""
+        return f"{sign}{pct:.2f}%"
+
+    lines = [
+        f"🚨 *Massive Volume Surge* — {tier_label} ({market.title()})",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+        f"Direction: *{direction_label}*  |  Last Price: `{_fmt_price(last_price)}`",
+        f"Move over this window: *{_pct_str(price_window_pct_change)}*  |  24h Change: *{_pct_str(change_24h)}*",
+        f"Traded in last ~{window_minutes:.0f}m: *{_fmt_usdt(interval_volume)}* "
+        f"(threshold: {_fmt_usdt(threshold_usdt)})",
+    ]
+
+    if trend:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("*Trend across timeframes:*")
+        for label, key in (("30m", "30m"), ("1h", "1h"), ("4h", "4h"), ("1D", "1d")):
+            pct = trend.get(key)
+            if pct is None:
+                continue
+            arrow = "🟢▲" if pct >= 0 else "🔴▼"
+            lines.append(f"  {label}: {arrow} {_pct_str(pct)}")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(
+        "_A huge amount of money just moved through this pair in a short "
+        "window - worth checking what's driving it._"
+    )
+    return "\n".join(lines)
+
+
+def format_main_meme_move_alert(pair: str, last_price: float, pct_change: float,
+                                 direction: str, tier: str, market: str) -> str:
+    """
+    24/7 Market Analyse add-on #4/#5 - a MAIN coin (BTC/ETH/SOL/BNB,
+    tight symmetric bar - main_coin_watch in settings.yaml) or a
+    MEME/alt coin (much wider, asymmetric bar - meme_coin_watch) just
+    crossed its 24h% move threshold, read straight off the exchange's
+    own rolling 24h% ticker field. `tier` ("main"/"meme") picks a
+    visually distinct header so the two are unmistakable at a glance -
+    a 3% BTC move and a 45% meme-coin move are very different events
+    even though both trip this same code path.
+    """
+    direction_label = "🟢 UP" if direction == "up" else "🔴 DOWN"
+    sign = "+" if pct_change >= 0 else ""
+    if tier == "main":
+        header = f"🏛 *Main Coin Move* ({market.title()})"
+        note = "_A major coin rarely moves this much this fast - worth a look._"
+    else:
+        header = f"🐸 *Meme/Alt Coin Move* ({market.title()})"
+        note = "_Large, fast move on this pair - can reverse just as fast, trade with caution._"
     return (
-        f"🚨 *Massive Volume Surge* ({market.title()})\n"
+        f"{header}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Pair: `{pair}`\n"
-        f"Last Price: `{_fmt_price(last_price)}`\n"
-        f"Traded in last ~{window_minutes:.0f}m: *{_fmt_usdt(interval_volume)}* "
-        f"(threshold: {_fmt_usdt(threshold_usdt)})\n"
+        f"Direction: *{direction_label}*  |  Last Price: `{_fmt_price(last_price)}`\n"
+        f"24h Change: *{sign}{pct_change:.2f}%*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"_A huge amount of money just moved through this pair in a short "
-        f"window - worth checking what's driving it._"
+        f"{note}"
     )
 
 
@@ -366,6 +431,49 @@ def format_signal_outcomes_status(stats: dict) -> str:
     return "\n".join(lines)
 
 
+def format_token_listing_alert(action: str, pair: str, market: str, details: dict | None) -> str:
+    """
+    24/7 Market Analyse add-on #6 - a pair just appeared on or
+    disappeared from Bitget's own token list.
+
+    `action`: "added" or "removed".
+    `details`: current ticker fields (lastPrice/change24h/usdtVolume24h)
+    for a NEW listing, or the LAST KNOWN snapshot of those same fields
+    for a delisting - either way, whatever's known at the moment this
+    fires. None means no usable price data either way (shows just the
+    pair name + event).
+    """
+    if action == "added":
+        header = f"🆕 *New Token Listed* ({market.title()})"
+        detail_label = "Current Details"
+        note = "_Just appeared on Bitget - no trading history yet, so treat any signal on it with extra caution._"
+    else:
+        header = f"🗑 *Token Delisted* ({market.title()})"
+        detail_label = "Last Known Details"
+        note = "_No longer tradeable on Bitget - any open position or signal on this pair needs to be closed out manually._"
+
+    lines = [
+        header,
+        _send_time_line(),
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+    ]
+
+    if details:
+        lines.append(f"*{detail_label}:*")
+        if details.get("lastPrice") is not None:
+            lines.append(f"  Price: `{_fmt_price(details['lastPrice'])}`")
+        if details.get("change24h") is not None:
+            sign = "+" if details["change24h"] >= 0 else ""
+            lines.append(f"  24h Change: {sign}{details['change24h']:.2f}%")
+        if details.get("usdtVolume24h") is not None:
+            lines.append(f"  24h Volume: {_fmt_usdt(details['usdtVolume24h'])}")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(note)
+    return "\n".join(lines)
+
+
 def format_tier_move_alert(pair: str, last_price: float, pct_change: float, candle_interval: str,
                             candle_volume_usdt: float, market: str) -> str:
     """
@@ -388,27 +496,86 @@ def format_tier_move_alert(pair: str, last_price: float, pct_change: float, cand
     )
 
 
+def format_early_momentum_alert(pair: str, market: str, last_price: float, pct_change: float,
+                                 direction: str, lookback_seconds: float) -> str:
+    """
+    "Find 24/7 Strong Signal" add-on: Early Momentum Watch (see
+    jobs/strong_signal_watcher.py's early_watch_tick()). A pair the
+    LAST full scan rated as unremarkable (below weak_confidence_ceiling)
+    has moved sharply since then - a cheap, fast, ticker-only heads-up,
+    deliberately NOT styled like a full Strong Signal (no confidence
+    score, no trade plan) since this hasn't gone through the full
+    indicator pipeline yet - it's a "go take a closer look" nudge, not
+    a signal to act on directly.
+    """
+    direction_label = "🟢 UP" if direction == "up" else "🔴 DOWN"
+    sign = "+" if pct_change >= 0 else ""
+    lookback_minutes = lookback_seconds / 60
+    return (
+        f"👀 *Early Momentum Watch* ({market.title()})\n"
+        f"{_send_time_line()}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Pair: `{pair}`\n"
+        f"Direction: *{direction_label}*  |  Last Price: `{_fmt_price(last_price)}`\n"
+        f"Move in last ~{lookback_minutes:.0f}m: *{sign}{pct_change:.2f}%*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"_This pair scored low on the last full scan but is moving fast now - "
+        f"worth a Search Signal or Single Pair Analyse look. Not a full trade signal yet._"
+    )
+
+
 def format_pump_reversal_alert(pair: str, market: str, cumulative_pct: float, peak_price: float,
-                                current_price: float, drop_pct: float, sell_pct: float | None) -> str:
+                                current_price: float, drop_pct: float, sell_pct: float | None,
+                                entry: float | None = None, stop_loss: float | None = None,
+                                tp1: float | None = None, tp2: float | None = None,
+                                tp3: float | None = None, trade_id: str | None = None) -> str:
     """
     Phase 2.2 add-on - pushed by jobs/strong_signal_watcher.py for a
     pair that was flagged as overextended (a large multi-day cumulative
-    pump - see engine/pump_tracker.py) and has now started reversing
-    with real sell pressure. Deliberately biased to read as a SELL
-    call, not a neutral FYI - per the explicit request that extreme
-    pumps reversing should be treated as high-probability SELL setups.
+    pump) and has now started reversing with real sell pressure.
+    Deliberately biased to read as a SELL call, not a neutral FYI - per
+    the explicit request that extreme pumps reversing should be
+    treated as high-probability SELL setups.
+
+    `entry`/`stop_loss`/`tp1`/`tp2`/`tp3`/`trade_id`, when given, print
+    the same Trade ID + trade-plan block every other signal type
+    already has - a pump-reversal signal has always had strong
+    evidence behind it (cumulative pump % + real order-flow
+    confirmation) but never actually said what to DO about it in
+    concrete price terms until now.
     """
     flow_line = f"Order flow: *{sell_pct:.1f}%* sell-side" if sell_pct is not None else "Order flow: not available right now"
-    return (
-        f"🔻 *Strong Signal — SELL (Pump Reversal)* ({market.title()})\n\n"
-        f"Pair: `{pair}`\n"
-        f"Cumulative pump: *+{cumulative_pct:.0f}%* before this reversal\n"
-        f"Peak: `{_fmt_price(peak_price)}` → Now: `{_fmt_price(current_price)}` (*-{drop_pct:.1f}%* off peak)\n"
-        f"{flow_line}\n\n"
-        f"_This pair pumped hard and is now showing real reversal pressure - "
-        f"extended parabolic moves like this tend to give back a large chunk of "
-        f"the move fast. Bias: SELL._"
+    trade_id_line = f"Trade ID : `{trade_id}`\n" if trade_id else ""
+
+    lines = [
+        f"🔻 *Strong Signal — SELL* _(Pump Reversal)_ ({market.title()})",
+        f"{trade_id_line}"
+        f"{_send_time_line()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+        f"Cumulative pump: *+{cumulative_pct:.0f}%* before this reversal",
+        f"Peak: `{_fmt_price(peak_price)}` → Now: `{_fmt_price(current_price)}` (*-{drop_pct:.1f}%* off peak)",
+        flow_line,
+    ]
+
+    if entry is not None and stop_loss is not None:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"Entry: `{_fmt_price(entry)}`")
+        lines.append(f"SL: `{_fmt_price(stop_loss)}`")
+        if tp1 is not None:
+            lines.append(f"TP1: `{_fmt_price(tp1)}`")
+        if tp2 is not None:
+            lines.append(f"TP2: `{_fmt_price(tp2)}`")
+        if tp3 is not None:
+            lines.append(f"TP3: `{_fmt_price(tp3)}`")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(
+        "_This pair pumped hard and is now showing real reversal pressure - "
+        "extended parabolic moves like this tend to give back a large chunk of "
+        "the move fast. Bias: SELL._"
     )
+    return "\n".join(lines)
 
 
 def format_money_management_block(mm: dict | None) -> str:
@@ -1083,24 +1250,19 @@ def format_strong_signal_status(status: dict) -> str:
             lines.append(f"Scans the whole market every {int(interval // 60)}m")
 
     w = status["watcherScans"]
-    s = status["searchScans"]
-    watcher_runs = w["success"] + w["failed"]
-    search_runs = s["success"] + s["failed"]
     min_conf = status.get("minConfidenceToPush")
 
     lines += [
         "",
-        "📋 *Scan Activity* _(a scan run ≠ a signal - see below)_",
-        f"  • 24/7 watcher: {watcher_runs} full market scan(s) run "
+        "📋 *Scan Activity*",
+        f"  • Full market scans run: *{w['success'] + w['failed']}* "
         f"(✅ {w['success']} completed, ❌ {w['failed']} failed)",
-        f"  • Search Signal (manual button): {search_runs} run(s) "
-        f"(✅ {s['success']} completed, ❌ {s['failed']} failed)",
     ]
     if min_conf is not None:
         lines.append(
-            f"  _A completed scan only sends a message here if it finds a setup scoring "
-            f"{min_conf:.0f}+/100 confidence - otherwise it finishes with nothing to push, "
-            f"which is normal, not a malfunction._"
+            f"  _A scan only sends a signal here if it finds a setup scoring "
+            f"{min_conf:.0f}+/100 confidence - otherwise it finishes clean with nothing "
+            f"to push, which is normal, not a malfunction._"
         )
 
     lines += [

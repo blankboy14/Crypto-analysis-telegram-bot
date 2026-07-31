@@ -67,6 +67,7 @@ async def start_watching(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     settings = context.bot_data.get("settings", {})
     watch_cfg = settings.get("strong_signal_watch", {})
     interval = watch_cfg.get("scan_interval_seconds", 900)
+    early_watch_interval = watch_cfg.get("early_watch_interval_seconds", 240)
 
     _cancel_existing_job(context, chat_id)
     context.job_queue.run_repeating(
@@ -76,6 +77,18 @@ async def start_watching(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         chat_id=chat_id,
         data={"market": market},
         name=_job_name(chat_id),
+    )
+    # Separate, faster-cycling job - see jobs/strong_signal_watcher.py's
+    # early_watch_tick() docstring for why this can't just be folded
+    # into the main tick() above (it needs its OWN schedule, not just a
+    # cache-freshness window inside the same callback).
+    context.job_queue.run_repeating(
+        strong_signal_watcher.early_watch_tick,
+        interval=early_watch_interval,
+        first=early_watch_interval,
+        chat_id=chat_id,
+        data={"market": market},
+        name=_early_watch_job_name(chat_id),
     )
     state_store.set_mode_on(chat_id, MODE, market)
 
@@ -93,6 +106,12 @@ def _job_name(chat_id: int) -> str:
     return f"{JOB_PREFIX}:{chat_id}"
 
 
+def _early_watch_job_name(chat_id: int) -> str:
+    return f"{JOB_PREFIX}_early_watch:{chat_id}"
+
+
 def _cancel_existing_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     for job in context.job_queue.get_jobs_by_name(_job_name(chat_id)):
+        job.schedule_removal()
+    for job in context.job_queue.get_jobs_by_name(_early_watch_job_name(chat_id)):
         job.schedule_removal()

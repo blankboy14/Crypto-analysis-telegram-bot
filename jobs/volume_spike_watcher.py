@@ -39,6 +39,7 @@ from bot import state_store
 from bot.formatters import (
     format_volume_spike_alert, format_volume_burst_alert,
     format_absolute_volume_alert, format_daily_mover_alert, format_tier_move_alert,
+    format_main_meme_move_alert, format_token_listing_alert,
 )
 
 log = logging.getLogger("crypto-telegram-bot")
@@ -54,6 +55,19 @@ _price_history: dict[tuple[str, str], list[tuple[float, float]]] = {}
 # (chat_id, raw_symbol, direction) -> unix ts of the last alert sent
 # for that exact pair+direction, for this chat's cooldown.
 _last_alert: dict[tuple[int, str, str], float] = {}
+
+# --- add-on #6: New/Delisted Token watch ---
+# scope ("bitget-spot"/"bitget-futures") -> {rawSymbol: token_dict},
+# the FULL token list as of the last tick that actually compared it -
+# shared across every chat's tick, same reasoning as _price_history
+# above. None until the first comparison tick has run.
+_listing_snapshot: dict[str, dict] = {}
+
+# A listing/delisting is inherently a one-time event (not a recurring
+# threshold like a price move) - this is just a safety margin against
+# a duplicate push if a cache boundary and a chat's tick land awkwardly
+# close together, not a "notify again every N hours" cooldown.
+_LISTING_ALERT_DEDUP_SECONDS = 21600  # 6 hours
 
 # Keep enough history that a slightly-late tick can still find a
 # reasonable baseline to compare against.
@@ -81,7 +95,7 @@ _VOLUME_DELTA_HISTORY_MAX = 20
 # (exchange, raw_symbol) -> [(timestamp, usdtVolume24h), ...], kept much
 # longer than _volume_history above since this needs a baseline up to
 # window_seconds (e.g. 30 minutes) old, not just one poll_interval old.
-_abs_volume_history: dict[tuple, list[tuple[float, float]]] = {}
+_abs_volume_history: dict[tuple, list[tuple[float, float, float]]] = {}
 _ABS_VOLUME_HISTORY_MAX_AGE_SECONDS = 3600  # 1 hour of headroom regardless of configured window_seconds
 
 # --- daily reset big-mover tracking (add-on #2) ---
@@ -280,6 +294,113 @@ def _detect_moves(scopes: list, cfg: dict) -> list:
     return events
 
 
+# --- add-on #6: New/Delisted Token watch ---
+_listing_events_cache: dict = {}   # scope -> {"events": [...], "ts": float}
+
+
+def _detect_token_listing_changes(scope: str, max_age_seconds: float) -> list:
+    """
+    Compares this scope's current token list against the snapshot from
+    the last time this actually ran a comparison (_listing_snapshot),
+    cached for max_age_seconds so several chats' ticks landing close
+    together all see the same batch instead of only the first one
+    detecting anything. The very FIRST call ever for a scope just
+    seeds _listing_snapshot and returns no events - there's nothing to
+    compare against yet, and treating "every pair currently listed" as
+    "newly added" on a fresh startup would be exactly wrong.
+    """
+    cached = _listing_events_cache.get(scope)
+    now = time.time()
+    if cached and (now - cached["ts"]) < max_age_seconds:
+        return cached["events"]
+
+    try:
+        tokens = get_token_list(scope)["tokens"]
+    except Exception as exc:
+        log.error(f"Token listing watch: token list fetch failed for {scope}: {exc}")
+        return []
+
+    current = {t["rawSymbol"]: t for t in tokens}
+    previous = _listing_snapshot.get(scope)
+    _listing_snapshot[scope] = current
+
+    events = []
+    if previous is not None:
+        for raw_symbol, token in current.items():
+            if raw_symbol not in previous:
+                events.append({
+                    "action": "added", "scope": scope, "rawSymbol": raw_symbol,
+                    "symbol": token["symbol"], "details": token,
+                })
+        for raw_symbol, token in previous.items():
+            if raw_symbol not in current:
+                events.append({
+                    "action": "removed", "scope": scope, "rawSymbol": raw_symbol,
+                    "symbol": token["symbol"], "details": token,
+                })
+
+    _listing_events_cache[scope] = {"events": events, "ts": now}
+    return events
+
+
+def _detect_main_meme_coin_moves(scopes: list, main_cfg: dict, meme_cfg: dict) -> list:
+    """
+    24/7 Market Analyse add-on #4/#5. Unlike _detect_moves() above
+    (which needs a rolling in-memory price history to compute "moved
+    X% in the last poll window"), this reads the exchange's own
+    ROLLING 24h% field straight off the ticker - no warm-up period,
+    correct from the very first tick after a restart.
+
+    main_cfg.symbols decides which pairs are "main coins" (tight,
+    symmetric bar) - everything else is treated as a meme/alt coin
+    (much wider, ASYMMETRIC bar: a meme coin dumping matters sooner
+    than the same-size pump). Each function call checks BOTH tiers in
+    one pass over the token list rather than two separate scans.
+    """
+    events = []
+    if not main_cfg.get("enabled", True) and not meme_cfg.get("enabled", True):
+        return events
+
+    main_symbols = {s.upper() for s in main_cfg.get("symbols", [])}
+    main_threshold = main_cfg.get("pct_threshold", 3.0)
+    meme_up_threshold = meme_cfg.get("up_threshold_pct", 40.0)
+    meme_down_threshold = meme_cfg.get("down_threshold_pct", 30.0)
+
+    for scope in scopes:
+        try:
+            tokens = get_token_list(scope)["tokens"]
+        except Exception as exc:
+            log.error(f"Main/meme coin watch: token list fetch failed for {scope}: {exc}")
+            continue
+
+        for token in tokens:
+            raw_symbol = token["rawSymbol"]
+            pct_change = token.get("change24h")
+            if pct_change is None:
+                continue
+
+            is_main = raw_symbol.upper() in main_symbols
+            if is_main:
+                if not main_cfg.get("enabled", True) or abs(pct_change) < main_threshold:
+                    continue
+                tier = "main"
+            else:
+                if not meme_cfg.get("enabled", True):
+                    continue
+                threshold = meme_up_threshold if pct_change > 0 else meme_down_threshold
+                if abs(pct_change) < threshold:
+                    continue
+                tier = "meme"
+
+            events.append({
+                "exchange": scope, "rawSymbol": raw_symbol, "symbol": token["symbol"],
+                "lastPrice": token.get("lastPrice"), "pctChange": pct_change,
+                "direction": "up" if pct_change > 0 else "down", "tier": tier,
+            })
+
+    return events
+
+
 def _trim(samples: list, now: float, max_age: float) -> None:
     """Generic version of _trim_history/_trim_volume_history for any (timestamp, value) list."""
     if not samples:
@@ -302,30 +423,46 @@ def _find_closest_with_ts(history: list, now: float, target_age: float):
     """
     if not history:
         return None
-    candidates = [(abs((now - ts) - target_age), ts, val) for ts, val in history if now - ts >= target_age * 0.5]
+    candidates = [
+        (abs((now - ts) - target_age), ts, val, price)
+        for ts, val, price in history
+        if now - ts >= target_age * 0.5
+    ]
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0])
-    _, ts, val = candidates[0]
-    return ts, val
+    _, ts, val, price = candidates[0]
+    return ts, val, price
 
 
-def _detect_absolute_volume_bursts(scopes: list, cfg: dict) -> list:
+def _detect_absolute_volume_bursts(scopes: list, cfg: dict, main_symbols: set) -> list:
     """
     24/7 Market Analyse add-on #1. Unlike _detect_volume_bursts() above
     (which flags a pair moving far past ITS OWN recent baseline), this
     flags a pair the moment its traded volume crosses a fixed absolute
     USDT amount within a rolling window - e.g. a pair that normally
-    does ~100k/interval suddenly trading 60M+ within 30 minutes gets
+    does ~100k/interval suddenly trading 100M+ within 30 minutes gets
     caught here even on its very first sample, with no "warm-up"
     baseline needed for the pair itself.
+
+    `main_symbols` (from main_coin_watch.symbols in settings.yaml, the
+    same shared list used by the main/meme 24h% watchers) decides
+    which of cfg's two thresholds applies - see
+    absolute_volume_watch's comment in settings.yaml for why a meme
+    coin's bar is set HIGHER, not lower.
+
+    Also tracks PRICE alongside volume in the same history now (not
+    just volume) - added so the alert can say whether that huge amount
+    of money pushed the price up or down over the window, not just
+    "a lot of money moved".
     """
     if not cfg.get("enabled", True):
         return []
 
     now = time.time()
     window_seconds = cfg.get("window_seconds", 1800)
-    abs_threshold = cfg.get("absolute_threshold_usdt", 60_000_000)
+    main_threshold = cfg.get("main_coin_threshold_usdt", 100_000_000)
+    meme_threshold = cfg.get("meme_coin_threshold_usdt", 200_000_000)
 
     events = []
     for scope in scopes:
@@ -338,19 +475,19 @@ def _detect_absolute_volume_bursts(scopes: list, cfg: dict) -> list:
         for token in tokens:
             raw_symbol = token["rawSymbol"]
             vol24h = token.get("usdtVolume24h")
-            if not vol24h:
+            price = token.get("lastPrice")
+            if not vol24h or not price:
                 continue
-
             key = (scope, raw_symbol)
             history = _abs_volume_history.setdefault(key, [])
             baseline = _find_closest_with_ts(history, now, window_seconds)
-            history.append((now, vol24h))
+            history.append((now, vol24h, price))
             _trim(history, now, _ABS_VOLUME_HISTORY_MAX_AGE_SECONDS)
 
             if baseline is None:
                 continue  # still warming up - not enough history for this pair yet
 
-            baseline_ts, baseline_vol = baseline
+            baseline_ts, baseline_vol, baseline_price = baseline
             actual_window = now - baseline_ts
             if actual_window <= 0:
                 continue
@@ -359,6 +496,9 @@ def _detect_absolute_volume_bursts(scopes: list, cfg: dict) -> list:
             if interval_volume <= 0:
                 continue
 
+            is_main = raw_symbol.upper() in main_symbols
+            abs_threshold = main_threshold if is_main else meme_threshold
+
             # Scale the threshold to the ACTUAL elapsed comparison
             # window rather than the configured one - this is what
             # keeps "X+ within Y minutes" correct even if a tick lands
@@ -366,13 +506,44 @@ def _detect_absolute_volume_bursts(scopes: list, cfg: dict) -> list:
             scaled_threshold = abs_threshold * (actual_window / window_seconds)
 
             if interval_volume >= scaled_threshold:
+                price_pct_change = ((price - baseline_price) / baseline_price * 100) if baseline_price else None
                 events.append({
                     "exchange": scope, "rawSymbol": raw_symbol, "symbol": token["symbol"],
-                    "lastPrice": token.get("lastPrice"), "intervalVolume": interval_volume,
+                    "lastPrice": price, "intervalVolume": interval_volume,
                     "windowSeconds": actual_window, "thresholdUsdt": scaled_threshold,
+                    "priceWindowPctChange": price_pct_change,
+                    "direction": "up" if (price_pct_change or 0) >= 0 else "down",
+                    "isMain": is_main, "change24h": token.get("change24h"),
                 })
 
     return events
+
+
+def _fetch_multi_timeframe_trend(scope: str, raw_symbol: str) -> dict:
+    """
+    Only called once an absolute-volume alert is actually about to
+    fire (NOT on every tick for every pair) - one open/close % move
+    per timeframe, from that timeframe's own latest candle. Answers
+    "which direction has this pair actually been trending on 30m/1h/
+    4h/1D" alongside the raw volume number, so the alert says more
+    than just "a lot of money moved" (see format_absolute_volume_alert).
+    Any timeframe that fails to fetch is just omitted, not a bug -
+    the alert still sends with whichever timeframes did come back.
+    """
+    trend = {}
+    for label, granularity in (("30m", "30m"), ("1h", "1h"), ("4h", "4h"), ("1d", "1d")):
+        try:
+            if scope == "bitget-futures":
+                candles = fetch_bitget_futures_candles(raw_symbol, granularity, limit=1)
+            else:
+                candles = fetch_bitget_spot_candles(raw_symbol, granularity, limit=1)
+            if candles:
+                c = candles[-1]
+                if c.get("open") and c.get("close"):
+                    trend[label] = (c["close"] - c["open"]) / c["open"] * 100
+        except Exception as exc:
+            log.error(f"Absolute volume watch: {label} trend fetch failed for {raw_symbol}: {exc}")
+    return trend
 
 
 def _daily_period_id(now_ts: float, reset_hour_utc: int) -> str:
@@ -624,8 +795,15 @@ async def tick(context) -> None:
     # --- absolute volume burst check (add-on #1: fixed USDT bar) ---
     abs_cfg = settings.get("absolute_volume_watch", {})
     abs_cooldown = abs_cfg.get("cooldown_seconds", 1800)
+    main_cfg = settings.get("main_coin_watch", {})
+    main_symbols = {s.upper() for s in main_cfg.get("symbols", [])}
     try:
-        abs_events = _detect_absolute_volume_bursts(scopes, abs_cfg)
+        # BUG FIX: this call was missing main_symbols entirely, which
+        # made _detect_absolute_volume_bursts() raise a TypeError on
+        # EVERY tick (silently caught below) - the absolute-volume
+        # ("Massive Volume Surge") alert has never actually been able
+        # to fire until this fix.
+        abs_events = _detect_absolute_volume_bursts(scopes, abs_cfg, main_symbols)
     except Exception as exc:
         log.error(f"Absolute volume watch: tick failed for chat {chat_id}: {exc}")
         abs_events = []
@@ -636,11 +814,19 @@ async def tick(context) -> None:
         if now - last < abs_cooldown:
             continue
 
+        trend = {}
+        try:
+            trend = _fetch_multi_timeframe_trend(event["exchange"], event["rawSymbol"])
+        except Exception as exc:
+            log.error(f"Absolute volume watch: trend fetch failed for {event['rawSymbol']}: {exc}")
+
         try:
             text = format_absolute_volume_alert(
                 pair=event["symbol"], last_price=event["lastPrice"],
                 interval_volume=event["intervalVolume"], window_seconds=event["windowSeconds"],
                 threshold_usdt=event["thresholdUsdt"], market=market,
+                direction=event["direction"], price_window_pct_change=event["priceWindowPctChange"],
+                change_24h=event.get("change24h"), is_main=event["isMain"], trend=trend,
             )
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
             _last_alert[cooldown_key] = now
@@ -650,6 +836,76 @@ async def tick(context) -> None:
             )
         except Exception as exc:
             log.error(f"Absolute volume watch: failed to send alert to chat {chat_id}: {exc}")
+
+    # --- main coin / meme coin 24h% watch (add-on #4/#5) ---
+    # BUG FIX: _detect_main_meme_coin_moves() was fully written but
+    # never actually called from tick() - main coins (BTC/ETH/SOL/BNB,
+    # 3% bar) and meme/alt coins (40% up / 30% down bar) never got
+    # this check at all, regardless of settings.yaml being enabled.
+    meme_cfg = settings.get("meme_coin_watch", {})
+    main_meme_cooldown_main = main_cfg.get("cooldown_seconds", 1800)
+    main_meme_cooldown_meme = meme_cfg.get("cooldown_seconds", 1800)
+    try:
+        main_meme_events = _detect_main_meme_coin_moves(scopes, main_cfg, meme_cfg)
+    except Exception as exc:
+        log.error(f"Main/meme coin watch: tick failed for chat {chat_id}: {exc}")
+        main_meme_events = []
+
+    for event in main_meme_events:
+        cooldown_key = (chat_id, event["rawSymbol"], f"mainmeme_{event['direction']}")
+        cooldown = main_meme_cooldown_main if event["tier"] == "main" else main_meme_cooldown_meme
+        last = _last_alert.get(cooldown_key, 0)
+        if now - last < cooldown:
+            continue
+
+        try:
+            text = format_main_meme_move_alert(
+                pair=event["symbol"], last_price=event["lastPrice"], pct_change=event["pctChange"],
+                direction=event["direction"], tier=event["tier"], market=market,
+            )
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            _last_alert[cooldown_key] = now
+            state_store.log_alert(
+                chat_id, event["exchange"], event["rawSymbol"], event["symbol"],
+                event["direction"], event["pctChange"], event["lastPrice"],
+            )
+        except Exception as exc:
+            log.error(f"Main/meme coin watch: failed to send alert to chat {chat_id}: {exc}")
+
+    # --- new/delisted token watch (add-on #6) ---
+    listing_cfg = settings.get("token_listing_watch", {})
+    if listing_cfg.get("enabled", True):
+        # BUG FIX: poll_interval was referenced here but never defined in
+        # tick()'s scope (it only exists as a local inside
+        # _detect_volume_bursts()/_detect_moves()) - this raised a
+        # NameError on every tick once add-on #6 was enabled. Reuse the
+        # same volume_spike_watch poll interval those functions use.
+        poll_interval = cfg.get("poll_interval_seconds", 15)
+        listing_events = []
+        for scope in scopes:
+            try:
+                listing_events += _detect_token_listing_changes(scope, poll_interval)
+            except Exception as exc:
+                log.error(f"Token listing watch: tick failed for chat {chat_id} (scope={scope}): {exc}")
+
+        for event in listing_events:
+            cooldown_key = (chat_id, event["rawSymbol"], f"listing_{event['action']}")
+            last = _last_alert.get(cooldown_key, 0)
+            if now - last < _LISTING_ALERT_DEDUP_SECONDS:
+                continue
+
+            try:
+                text = format_token_listing_alert(
+                    action=event["action"], pair=event["symbol"], market=market, details=event["details"],
+                )
+                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                _last_alert[cooldown_key] = now
+                state_store.log_alert(
+                    chat_id, event["scope"], event["rawSymbol"], event["symbol"],
+                    event["action"], 0.0, event["details"].get("lastPrice"),
+                )
+            except Exception as exc:
+                log.error(f"Token listing watch: failed to send alert to chat {chat_id}: {exc}")
 
     # --- daily reset big-mover check (add-on #2) ---
     daily_cfg = settings.get("daily_mover_watch", {})

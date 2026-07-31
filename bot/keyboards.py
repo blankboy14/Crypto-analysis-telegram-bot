@@ -34,6 +34,7 @@ BTN_SINGLE_PAIR_ANALYSE = "🎯 Single Pair Analyse"
 BTN_MARKET_DETAILS = "📋 Market Details"
 BTN_WALLET_BALANCE = "💰 Wallet Balance"
 BTN_SERVER_INFORMATION = "🖥 Server Information"
+BTN_CLEAN_CHAT = "🧹 Clean Chat"
 BTN_HELP = "ℹ️ Help"
 
 # Order here = order shown on the keyboard (top to bottom).
@@ -51,6 +52,7 @@ MAIN_MENU_BUTTONS = [
     BTN_MARKET_DETAILS,
     BTN_WALLET_BALANCE,
     BTN_SERVER_INFORMATION,
+    BTN_CLEAN_CHAT,
     BTN_HELP,
 ]
 

@@ -46,7 +46,11 @@ signal_scoring:
 
 # --- Phase 2.1: "24/7 Market Analyse" volume-spike watcher ---
 volume_spike_watch:
-  poll_interval_seconds: 15
+  # Was 15 SECONDS - every 4 ticks a minute, across every pair on the
+  # exchange, is a real over-hit risk on Bitget's rate limits. 300 (5
+  # minutes) is still frequent enough to catch a genuine move quickly,
+  # at a fraction of the API load.
+  poll_interval_seconds: 300
   # % move within one poll window that counts as "suddenly moving" for
   # a normal pair (per the spec: e.g. 20-40% in a short burst).
   spike_pct_threshold: 20.0
@@ -85,9 +89,18 @@ volume_spike_watch:
 # usually does ~100k/interval suddenly trading 60M+ within 30 minutes).
 absolute_volume_watch:
   enabled: true
-  # The rolling comparison window - "60M+ within THIS many seconds".
+  # The rolling comparison window - "X+ within THIS many seconds".
   window_seconds: 1800  # 30 minutes
-  absolute_threshold_usdt: 60000000  # 60,000,000 USDT
+  # Separate bars for a main coin (BTC/ETH/SOL/BNB - see
+  # main_coin_watch.symbols below, shared by both features so the
+  # "which pairs count as major" list only lives in one place) vs
+  # everything else (treated as a meme/alt coin). A meme coin's
+  # normal volume is usually far smaller, so in absolute-dollar terms
+  # its bar is set HIGHER, not lower - $200M actually moving through a
+  # small-cap pair in 30 minutes is a much rarer, more extreme event
+  # than the same dollar amount on BTC.
+  main_coin_threshold_usdt: 80000000  # 80,000,000 USDT
+  meme_coin_threshold_usdt: 200000000  # 200,000,000 USDT
   # Ticks aren't always perfectly spaced (a bot hiccup, a chat joining
   # mid-cycle, etc.), so the ACTUAL elapsed time between "now" and the
   # sample being compared against is measured every time and the
@@ -109,29 +122,24 @@ absolute_volume_watch:
 # (UTC+6) - adjust if the "daily reset" should land at a different
 # local time.
 daily_mover_watch:
-  enabled: true
+  # DISABLED - superseded by main_coin_watch / meme_coin_watch below,
+  # which check the exchange's own rolling 24h% field directly instead
+  # of a once-a-day reset baseline. Left in place (not deleted) in
+  # case the "since a fixed daily reset time" behaviour is ever wanted
+  # again alongside the new watchers - the two don't conflict.
+  enabled: false
   reset_hour_utc: 0
-  # Separate bars for up vs down moves since a downside move matters
-  # sooner/at a smaller size than an equivalent upside move - both
-  # directions are checked every tick regardless (this always sends
-  # for either an up OR a down move once its own threshold is hit, not
-  # just up).
   up_threshold_pct: 60.0
   down_threshold_pct: 40.0
 
 # --- 24/7 Market Analyse add-on #3: per-pair volatility tiers ---
-# Some pairs (BTC, ETH, SOL, ...) rarely move more than a few % a day,
-# so the general spike_pct_threshold above (20%+) would basically
-# never fire for them and isn't the right bar - a much smaller move,
-# CONFIRMED by real candle volume (so it isn't just noise/a wick), is
-# already significant. Add more tiers/symbols here as needed; any pair
-# not listed in a tier just stays on the general watchers above.
+# DISABLED - superseded by main_coin_watch below, which checks the
+# same idea (major pairs need a much tighter bar than everyone else)
+# directly off the 24h% field instead of a custom candle calculation.
+# Left in place, not deleted, in case the candle-confirmed version is
+# ever wanted back.
 volatility_tier_watch:
-  enabled: true
-  # How often (seconds) candles are actually re-fetched per pair - kept
-  # well above the main poll_interval_seconds since candle calls are
-  # heavier than a ticker snapshot and a 30m/1m candle doesn't need
-  # checking every 15 seconds anyway.
+  enabled: false
   refresh_seconds: 60
   cooldown_seconds: 1800
   tiers:
@@ -144,10 +152,43 @@ volatility_tier_watch:
       candle_interval: "1m"
       min_candle_volume_usdt: 1000000
 
+# --- 24/7 Market Analyse add-on #4: Main Coin 24h% watch ---
+# The exchange's own rolling 24h% change field (no candle math, no
+# warm-up period needed - it's read straight off the ticker) for a
+# small, fixed list of major pairs. These rarely move more than a
+# couple % a day, so a much tighter bar than a normal/meme pair
+# already matters. `symbols` here is ALSO what main_coin_watch and
+# meme_coin_watch (below) and absolute_volume_watch (above) all use to
+# decide "is this pair a main coin or not" - one shared list.
+main_coin_watch:
+  enabled: true
+  symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+  pct_threshold: 3.0  # both directions
+  cooldown_seconds: 1800
+
+# --- 24/7 Market Analyse add-on #5: Meme/Alt Coin 24h% watch ---
+# Same idea as main_coin_watch, applied to every pair NOT in
+# main_coin_watch.symbols - a much bigger, ASYMMETRIC bar (a meme coin
+# dumping is worth flagging sooner than one pumping the same amount).
+meme_coin_watch:
+  enabled: true
+  up_threshold_pct: 40.0
+  down_threshold_pct: 30.0
+  cooldown_seconds: 1800
+
+# --- 24/7 Market Analyse add-on #6: New/Delisted Token watch ---
+# Compares each tick's token list against the previous tick's - any
+# rawSymbol that's newly present is a new Bitget listing, any that's
+# gone is a delisting. The very FIRST tick after a restart only seeds
+# the snapshot (nothing to compare against yet) - it never floods
+# every currently-listed pair as "new" on startup.
+token_listing_watch:
+  enabled: true
+
 # --- Phase 2.2: "Find Strong Signal" 24/7 scanner ---
 strong_signal_watch:
   # How often to re-run a full market scan while this mode is ON.
-  scan_interval_seconds: 900
+  scan_interval_seconds: 300
   # Only push a signal to the user once its confidence is at/above this.
   min_confidence_to_push: 80
   worker_count: 8
@@ -172,6 +213,36 @@ strong_signal_watch:
   # reversal once the price drop threshold is hit (if order flow is
   # unavailable, the price drop alone is treated as sufficient).
   reversal_sell_flow_pct: 55.0
+  # Trade plan levels for a pump-reversal SELL signal (there's no
+  # normal indicator-based trade plan for these - they come from
+  # price/order-flow, not engine.signal_scanner). Entry = current
+  # price. Stop-loss sits above the PEAK (not just above entry) - a
+  # push back above the peak fully invalidates the reversal thesis.
+  # TP1/2/3 are simple measured-move %s below entry.
+  pump_reversal_sl_buffer_above_peak_pct: 3.0
+  pump_reversal_tp1_pct: 5.0
+  pump_reversal_tp2_pct: 10.0
+  pump_reversal_tp3_pct: 15.0
+
+  # --- Early Momentum Watch add-on (point 2 of the "Find 24/7 Strong
+  # Signal" upgrade) ---
+  # Pairs that scored below weak_confidence_ceiling in the last full
+  # scan get re-checked on their OWN faster schedule
+  # (early_watch_interval_seconds), independent of the full scan's own
+  # scan_interval_seconds - a real move often starts on a pair the
+  # full scan just rated unremarkable, and waiting for the NEXT full
+  # scan could mean missing the early part of it. This is a cheap
+  # ticker-price-only check (no candles/indicators/order-flow), not a
+  # second full scan - it's a heads-up to go look closer (Search
+  # Signal / Single Pair Analyse), not a full Strong Signal itself.
+  weak_confidence_ceiling: 30
+  early_watch_interval_seconds: 240
+  # How far back to compare the current price against.
+  early_watch_lookback_seconds: 900
+  # % move (either direction) within early_watch_lookback_seconds that
+  # counts as "this quiet pair just wasn't quiet anymore".
+  early_watch_move_pct_threshold: 6.0
+  early_watch_cooldown_seconds: 1800
 
 # --- Phase 2.3: "Search Signal" one-shot scan ---
 search_signal:

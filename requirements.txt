@@ -6,6 +6,7 @@ python-telegram-bot[job-queue,rate-limiter]>=22.4
 
 # Engine dependencies (carried over from the reused analysis engine)
 requests>=2.31.0
+certifi>=2024.2.2
 feedparser>=6.0
 PyYAML>=6.0
 
