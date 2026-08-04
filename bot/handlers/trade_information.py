@@ -89,7 +89,7 @@ async def _get_live_price(rawSymbol: str, scope: str) -> float | None:
     - no dedicated extra API call in the common case. scope is
     'spot' or 'future' (matches signal_outcomes.scope).
     """
-    exchange = "bitget-futures" if scope == "future" else "bitget-spot"
+    exchange = "bitget-futures" if scope == "bitget-futures" else "bitget-spot"
     loop = asyncio.get_running_loop()
     token_list = await loop.run_in_executor(None, get_token_list, exchange)
     for token in token_list.get("tokens", []):
@@ -238,7 +238,7 @@ async def handle_balance_mode_choice(update: Update, context: ContextTypes.DEFAU
         )
         return
 
-    if trade["scope"] != "future":
+    if trade["scope"] != "bitget-futures":
         await context.bot.send_message(
             chat_id=chat_id, text=format_active_balance_spot_unsupported(), parse_mode="Markdown",
         )

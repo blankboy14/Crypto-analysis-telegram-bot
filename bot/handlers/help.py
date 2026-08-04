@@ -66,6 +66,13 @@ def _build_help_text(settings: dict) -> str:
         "Shows on/off state, how many scans have run, how many "
         "signals have been found, and your last 12 signals.\n\n"
 
+        "🚨 *High Alert Pairs*\n"
+        "Live, on-demand list of every pair currently sitting in the "
+        "High Alert pool right now (80%+ cumulative pump, or an "
+        "RSI extreme) — this is exactly the pool the next High Alert "
+        "scan will check against the full engine, before it's "
+        "actually confirmed into a pushed signal.\n\n"
+
         "🔎 *Search Signal*\n"
         "A one-shot scan you trigger manually instead of waiting for "
         "the 24/7 scanner: pick Spot / Future / Both, optionally see "

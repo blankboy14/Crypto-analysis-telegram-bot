@@ -30,7 +30,7 @@ from telegram.ext import ContextTypes
 
 from bot import state_store
 from bot.handlers import market_select
-from jobs import strong_signal_watcher
+from jobs import strong_signal_watcher, meme_move_watcher, high_alert_watcher, rsi_extreme_watcher
 
 log = logging.getLogger("crypto-telegram-bot")
 
@@ -90,6 +90,47 @@ async def start_watching(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         data={"market": market},
         name=_early_watch_job_name(chat_id),
     )
+    # "Meme/Alt Coin Move" add-on - rides this same toggle (see
+    # jobs/meme_move_watcher.py's module docstring), own schedule since
+    # its check interval is independent of the two above.
+    meme_watch_cfg = settings.get("meme_move_watch", {})
+    meme_move_interval = meme_watch_cfg.get("check_interval_seconds", 60)
+    context.job_queue.run_repeating(
+        meme_move_watcher.tick,
+        interval=meme_move_interval,
+        first=meme_move_interval,
+        chat_id=chat_id,
+        data={"market": market},
+        name=_meme_move_job_name(chat_id),
+    )
+    # "High Alert Pair Analyse" add-on - also rides this same toggle
+    # (see jobs/high_alert_watcher.py's module docstring): runs the
+    # FULL indicator engine, but only against pairs already flagged
+    # overextended by the pump-reversal check above.
+    high_alert_cfg = settings.get("high_alert_watch", {})
+    high_alert_interval = high_alert_cfg.get("check_interval_seconds", 300)
+    context.job_queue.run_repeating(
+        high_alert_watcher.tick,
+        interval=high_alert_interval,
+        first=high_alert_interval,
+        chat_id=chat_id,
+        data={"market": market},
+        name=_high_alert_job_name(chat_id),
+    )
+    # "RSI Extreme" add-on - also rides this same toggle (see
+    # jobs/rsi_extreme_watcher.py's module docstring): 80/90/100
+    # overbought and 25/20/15 oversold checkpoints, feeding pairs into
+    # the SAME High Alert Pair pool as the pump/reversal add-on above.
+    rsi_extreme_cfg = settings.get("rsi_extreme_watch", {})
+    rsi_extreme_interval = rsi_extreme_cfg.get("check_interval_seconds", 300)
+    context.job_queue.run_repeating(
+        rsi_extreme_watcher.tick,
+        interval=rsi_extreme_interval,
+        first=rsi_extreme_interval,
+        chat_id=chat_id,
+        data={"market": market},
+        name=_rsi_extreme_job_name(chat_id),
+    )
     state_store.set_mode_on(chat_id, MODE, market)
 
     label = MARKET_LABELS.get(market, market)
@@ -110,8 +151,26 @@ def _early_watch_job_name(chat_id: int) -> str:
     return f"{JOB_PREFIX}_early_watch:{chat_id}"
 
 
+def _meme_move_job_name(chat_id: int) -> str:
+    return f"{JOB_PREFIX}_meme_move:{chat_id}"
+
+
+def _high_alert_job_name(chat_id: int) -> str:
+    return f"{JOB_PREFIX}_high_alert:{chat_id}"
+
+
+def _rsi_extreme_job_name(chat_id: int) -> str:
+    return f"{JOB_PREFIX}_rsi_extreme:{chat_id}"
+
+
 def _cancel_existing_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     for job in context.job_queue.get_jobs_by_name(_job_name(chat_id)):
         job.schedule_removal()
     for job in context.job_queue.get_jobs_by_name(_early_watch_job_name(chat_id)):
+        job.schedule_removal()
+    for job in context.job_queue.get_jobs_by_name(_meme_move_job_name(chat_id)):
+        job.schedule_removal()
+    for job in context.job_queue.get_jobs_by_name(_high_alert_job_name(chat_id)):
+        job.schedule_removal()
+    for job in context.job_queue.get_jobs_by_name(_rsi_extreme_job_name(chat_id)):
         job.schedule_removal()

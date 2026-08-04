@@ -257,8 +257,26 @@ def _fetch_bitget_paginated(base_url, symbol, granularity_key, limit, granularit
         candles = sorted(deduped.values(), key=lambda c: c["time"])
         return candles[-limit:]
     except Exception as e:
+        if all_candles:
+            # Got at least some pages before this happened (e.g. hit the
+            # rate limit midway through pagination) - that partial data
+            # is still genuinely useful, so return it as before instead
+            # of throwing it away.
+            log.warning(f"Bitget candle fetch partially failed for {symbol} @ {granularity_key} ({base_url}) - returning {len(all_candles)} candles fetched before the error: {e}")
+            return all_candles
+        # Total failure (e.g. 429 on the very first page). Every caller
+        # of fetch_bitget_spot_candles/fetch_bitget_futures_candles
+        # already wraps its call in its own try/except expecting this to
+        # raise (see engine/signal_scanner.py's retry-with-backoff,
+        # jobs/volume_spike_watcher.py, jobs/signal_outcome_tracker.py -
+        # all three log "candle fetch failed" from their OWN except
+        # blocks) - swallowing the exception here instead of raising
+        # meant those callers' except blocks, and signal_scanner.py's
+        # retry in particular, could never actually run; a transient
+        # 429 permanently skipped that timeframe for the whole scan
+        # instead of getting the intended one retry.
         log.error(f"Bitget candle fetch failed for {symbol} @ {granularity_key} ({base_url}): {e}")
-        return all_candles if all_candles else None
+        raise
 
 
 def fetch_bitget_spot_candles(symbol, granularity_key, limit=None):

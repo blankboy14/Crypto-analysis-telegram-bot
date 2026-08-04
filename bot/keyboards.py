@@ -27,6 +27,7 @@ BTN_MARKET_ANALYSE_STATUS = "📈 24/7 Market Analyse — Status"
 BTN_STRONG_SIGNAL_ON = "🔥 Find 24/7 Strong Signal"
 BTN_STRONG_SIGNAL_OFF = "🛑 Off 24/7 Find Signal"
 BTN_STRONG_SIGNAL_STATUS = "📈 Find 24/7 Strong Signal — Status"
+BTN_HIGH_ALERT_PAIRS = "🚨 High Alert Pairs"
 BTN_SEARCH_SIGNAL = "🔎 Search Signal"
 BTN_SEARCH_SIGNAL_STATUS = "📈 Search Signal — Status"
 BTN_TRADE_INFORMATION = "📈 Trade Information/Active"
@@ -35,6 +36,9 @@ BTN_MARKET_DETAILS = "📋 Market Details"
 BTN_WALLET_BALANCE = "💰 Wallet Balance"
 BTN_SERVER_INFORMATION = "🖥 Server Information"
 BTN_CLEAN_CHAT = "🧹 Clean Chat"
+BTN_DOWNLOAD_DB = "💾 Download Database"
+BTN_AUTO_BACKUP_ON = "🔁 Auto Backup ON"
+BTN_AUTO_BACKUP_OFF = "🔕 Auto Backup OFF"
 BTN_HELP = "ℹ️ Help"
 
 # Order here = order shown on the keyboard (top to bottom).
@@ -45,6 +49,7 @@ MAIN_MENU_BUTTONS = [
     BTN_STRONG_SIGNAL_ON,
     BTN_STRONG_SIGNAL_OFF,
     BTN_STRONG_SIGNAL_STATUS,
+    BTN_HIGH_ALERT_PAIRS,
     BTN_SEARCH_SIGNAL,
     BTN_SEARCH_SIGNAL_STATUS,
     BTN_TRADE_INFORMATION,
@@ -53,6 +58,9 @@ MAIN_MENU_BUTTONS = [
     BTN_WALLET_BALANCE,
     BTN_SERVER_INFORMATION,
     BTN_CLEAN_CHAT,
+    BTN_DOWNLOAD_DB,
+    BTN_AUTO_BACKUP_ON,
+    BTN_AUTO_BACKUP_OFF,
     BTN_HELP,
 ]
 

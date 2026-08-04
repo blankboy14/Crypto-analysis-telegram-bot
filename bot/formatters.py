@@ -578,6 +578,181 @@ def format_pump_reversal_alert(pair: str, market: str, cumulative_pct: float, pe
     return "\n".join(lines)
 
 
+def format_meme_move_checkpoint_alert(pair: str, market: str, direction: str, checkpoint_pct: float,
+                                       cumulative_pct: float, price: float, window_days: int) -> str:
+    """
+    jobs/meme_move_watcher.py - fires once a pair's trailing cumulative
+    move crosses a new checkpoint level in one direction: 60% then
+    every +20% on the way up (60/80/100/...), or -40% then every
+    -10% further down (-40/-50/-60/...) - see that module's docstring
+    for the exact stepping rule. Same "one clean push per checkpoint"
+    idea as strong signals, just for a raw meme/alt coin move instead
+    of a full indicator-confidence setup.
+    """
+    is_up = direction == "up"
+    header_icon = "🚀" if is_up else "🔻"
+    header_label = "MEME MOVE — PUMPING" if is_up else "MEME MOVE — DUMPING"
+    bar_icon = "🟩" if is_up else "🟥"
+    sign = "+" if is_up else ""
+
+    lines = [
+        f"{header_icon} *{header_label}* ({market.title()})",
+        f"{_send_time_line()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+        f"{bar_icon} Checkpoint reached: *{sign}{checkpoint_pct:.0f}%*",
+        f"Cumulative move ({window_days}d): *{sign}{cumulative_pct:.1f}%*",
+        f"Price now: `{_fmt_price(price)}`",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if is_up:
+        lines.append("_Still climbing - you'll get pinged again at every further +20% step, and separately if it snaps back hard off the top._")
+    else:
+        lines.append("_Still falling - you'll get pinged again at every further -10% step, and separately if it suddenly bounces off the bottom._")
+    return "\n".join(lines)
+
+
+def format_meme_move_reversal_alert(pair: str, market: str, reversal_type: str, cumulative_pct: float,
+                                     extreme_price: float, current_price: float, move_pct: float) -> str:
+    """
+    jobs/meme_move_watcher.py - fires when a tracked meme/alt coin move
+    snaps back the other way: reversal_type "pump_then_drop" (was up,
+    now pulling back off its peak) or "dump_then_bounce" (was down,
+    now bouncing off its trough). Always states the peak/trough it's
+    measured against AND the live "before -> now" % so the size of the
+    snap-back is unambiguous at a glance, per the explicit request for
+    this one.
+    """
+    is_pump_drop = reversal_type == "pump_then_drop"
+    header_icon = "⚠️🔻" if is_pump_drop else "⚠️🚀"
+    header_label = "MEME MOVE — PUMP REVERSING DOWN" if is_pump_drop else "MEME MOVE — DUMP REVERSING UP"
+    extreme_label = "Peak" if is_pump_drop else "Trough"
+    move_label = "off peak" if is_pump_drop else "off trough"
+    move_sign = "-" if is_pump_drop else "+"
+
+    lines = [
+        f"{header_icon} *{header_label}* ({market.title()})",
+        f"{_send_time_line()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+        f"Cumulative move before this: *{'+' if is_pump_drop else ''}{cumulative_pct:.1f}%*",
+        f"{extreme_label}: `{_fmt_price(extreme_price)}` → Now: `{_fmt_price(current_price)}` "
+        f"(*{move_sign}{move_pct:.1f}%* {move_label})",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if is_pump_drop:
+        lines.append("_A big move up is now giving some of it back fast - worth watching for further downside._")
+    else:
+        lines.append("_A big move down is now bouncing back fast - worth watching for further upside._")
+    return "\n".join(lines)
+
+
+def format_meme_move_4h_volume_alert(pair: str, market: str, direction: str, interval_volume: float,
+                                      price_before: float, price_now: float, hours: float) -> str:
+    """
+    jobs/meme_move_watcher.py - fires when a pair's traded USDT volume
+    over the trailing ~4h window itself passes a raw threshold (200M
+    default), independent of the multi-day cumulative checkpoint/
+    reversal tracking above. Tagged "up"/"down" by whether price rose
+    or fell over that same window, since a huge amount of volume means
+    something different depending on which way it pushed price.
+    """
+    is_up = direction == "up"
+    icon = "🟢📊" if is_up else "🔴📊"
+    return "\n".join([
+        f"{icon} *MEME MOVE — {hours:.0f}H VOLUME SPIKE* ({market.title()})",
+        f"{_send_time_line()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+        f"{hours:.0f}h traded volume: *${interval_volume:,.0f}*  ({'📈 UP' if is_up else '📉 DOWN'})",
+        f"~{hours:.0f}h ago: `{_fmt_price(price_before)}` → Now: `{_fmt_price(price_now)}`",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "_An unusually large amount of money moving through this pair in a single 4h window - worth a look._",
+    ])
+
+
+def format_meme_move_4h_price_alert(pair: str, market: str, move_pct: float, price_before: float,
+                                     price_now: float, hours: float) -> str:
+    """
+    jobs/meme_move_watcher.py - the separate, simpler 4H price-move
+    check: fires once a pair's price move over the trailing ~4h window
+    itself passes a raw % threshold (65% default), in EITHER direction,
+    independent of the multi-day cumulative checkpoint/reversal
+    tracking above.
+    """
+    is_up = move_pct >= 0
+    icon = "⚡🚀" if is_up else "⚡🔻"
+    sign = "+" if is_up else ""
+    return "\n".join([
+        f"{icon} *MEME MOVE — {hours:.0f}H PRICE SPIKE* ({market.title()})",
+        f"{_send_time_line()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+        f"{hours:.0f}h move: *{sign}{move_pct:.1f}%*",
+        f"~{hours:.0f}h ago: `{_fmt_price(price_before)}` → Now: `{_fmt_price(price_now)}`",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "_An unusually fast move for a single 4h window - typical of thin/low-liquidity meme coins. Trade size accordingly._",
+    ])
+
+
+def format_rsi_extreme_alert(pair: str, market: str, direction: str, level: float, rsi_value: float,
+                              timeframe: str) -> str:
+    """
+    jobs/rsi_extreme_watcher.py - fires the instant RSI crosses into
+    extreme territory (>=80, then every further +10 step: 80/90/100)
+    or (<=25, then every further -5 step: 25/20/15), and again at each
+    later checkpoint on the same pair. Explicitly calls out that the
+    pair has ALSO been added to the High Alert Pair scan pool (per the
+    request that this stay unambiguous - "no confusion" about what
+    happens next), since that's the whole point of flagging it this
+    early: it can turn any time from here.
+    """
+    is_high = direction == "high"
+    icon = "🔺🚨" if is_high else "🔻🚨"
+    header = "RSI EXTREME — OVERBOUGHT" if is_high else "RSI EXTREME — OVERSOLD"
+    watch_for = "a SELL reversal" if is_high else "a BUY reversal"
+    return "\n".join([
+        f"{icon} *{header}* ({market.title()})",
+        f"{_send_time_line()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+        f"RSI ({timeframe}) checkpoint: *{level:.0f}*  (now: *{rsi_value:.1f}*)",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"_Added to 🎯 High Alert Pair - the full indicator engine is now watching this pair specifically for {watch_for}. "
+        f"You'll get pinged again at every further checkpoint ({'110/120/...' if is_high else '10/5/...'}) while it stays this extreme._",
+    ])
+
+
+def format_rsi_retest_alert(pair: str, market: str, direction: str, level: float, rsi_value: float,
+                             timeframe: str) -> str:
+    """
+    jobs/rsi_extreme_watcher.py - fires ONCE for a pair that was
+    genuinely RSI-extreme (>=85 or <=16, i.e. it already has a
+    rsi_alert_state row) and has now pulled back through the classic
+    70 (overbought side) or 30 (oversold side) line. Only ever fires
+    for pairs that were extreme first - a pair casually crossing
+    70/30 with no prior extreme reading never reaches this formatter
+    at all, which is what keeps this side from spamming.
+    """
+    is_high = direction == "high"
+    icon = "🔁🔺" if is_high else "🔁🔻"
+    header = "RSI RETEST — 70 LINE" if is_high else "RSI RETEST — 30 LINE"
+    context_line = (
+        "Pulled back from overbought and just retested the *70* line from above."
+        if is_high else
+        "Bounced from oversold and just retested the *30* line from below."
+    )
+    return "\n".join([
+        f"{icon} *{header}* ({market.title()})",
+        f"{_send_time_line()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Pair: `{pair}`",
+        f"RSI ({timeframe}): *{rsi_value:.1f}*  (retest level: *{level:.0f}*)",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"_{context_line} This pair was flagged 🚨 RSI EXTREME first, so this is a confirmed retest - not a random 70/30 cross._",
+    ])
+
+
 def format_money_management_block(mm: dict | None) -> str:
     """
     Phase - Money Management add-on. `mm` is
@@ -669,7 +844,7 @@ def _trade_plan_block(result: dict, wallet_balance: float | None = None, mm_cfg:
 
 def format_strong_signal(result: dict, serial: int | None = None,
                           wallet_balance: float | None = None, mm_cfg: dict | None = None,
-                          trade_id: str | None = None) -> str:
+                          trade_id: str | None = None, badge: str | None = None) -> str:
     """
     Phase 2.2 - ONE high-confidence result from
     engine.signal_scanner.scan_market_above_confidence(), sent by
@@ -684,6 +859,12 @@ def format_strong_signal(result: dict, serial: int | None = None,
     (state_store.next_signal_serial) purely so the user can track "how
     many signals have I actually gotten", not a ranking of any kind.
 
+    `badge`, when given, is an extra line printed ABOVE the normal
+    "Trade Signal #N" header - used by jobs/high_alert_watcher.py to
+    mark a push as coming from the overextended-pair SELL scan
+    specifically, while reusing this exact same full breakdown (every
+    other field below is identical either way).
+
     Deliberately calmer/plainer than the old version: no siren emoji,
     no dense divider walls - reads like a written analysis a person
     would hand you, not an alarm.
@@ -695,7 +876,10 @@ def format_strong_signal(result: dict, serial: int | None = None,
     change_str = f"{change24h:+.2f}%" if isinstance(change24h, (int, float)) else "N/A"
     serial_str = f"#{serial}" if serial is not None else ""
 
-    lines = [
+    lines = []
+    if badge:
+        lines.append(badge)
+    lines += [
         f"*Trade Signal {serial_str}*".strip(),
         f"`{pair}`  —  24H: *{change_str}*",
     ]
@@ -1284,6 +1468,57 @@ def format_strong_signal_status(status: dict) -> str:
         lines.append("_No signals sent by the 24/7 watcher yet - it's still scanning "
                       "and hasn't found a setup that cleared the confidence bar above._")
 
+    return "\n".join(lines)
+
+
+_HIGH_ALERT_SCOPE_LABELS = {"bitget-spot": "Spot", "bitget-futures": "Future"}
+
+
+def format_high_alert_pairs(pool: dict) -> str:
+    """
+    "🚨 High Alert Pairs" button - see bot/handlers/high_alert_pairs.py
+    module docstring for exactly what's in `pool` (scope -> list of
+    candidate dicts, each already tagged with its source/verdict).
+    """
+    header = "🚨 *High Alert Pairs*"
+    total = sum(len(v) for v in pool.values())
+
+    if total == 0:
+        return (
+            f"{header}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "_Pool is empty right now - no pair is currently overextended "
+            "(80%+ cumulative pump) or sitting at an RSI extreme. This "
+            "updates live as strong_signal_watcher and rsi_extreme_watcher "
+            "tick, no action needed._"
+        )
+
+    lines = [
+        header,
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"_{total} pair(s) currently in the pool - these are what the next "
+        f"High Alert scan will check against the full engine._",
+    ]
+
+    for scope, candidates in pool.items():
+        if not candidates:
+            continue
+        scope_label = _HIGH_ALERT_SCOPE_LABELS.get(scope, scope)
+        lines.append("")
+        lines.append(f"*{scope_label}* — {len(candidates)} pair(s)")
+        for c in candidates:
+            verdict_arrow = "🔻 SELL-watch" if c["expectedVerdict"] == "SELL" else "🔺 BUY-watch"
+            if c["source"] == "pump":
+                detail = f"Pump +{c['cumulativePct']:.1f}% cumulative — flagged {_ago(c['flaggedAt'])}"
+            else:
+                detail = f"RSI extreme on {c['timeframe']}"
+            lines.append(f"  • `{c['symbol']}` — {verdict_arrow}\n    {detail}")
+
+    lines.append("")
+    lines.append(
+        "_A pair here isn't a signal yet - it only gets pushed once the "
+        "full engine confirms it and clears High Alert's own confidence bar._"
+    )
     return "\n".join(lines)
 
 

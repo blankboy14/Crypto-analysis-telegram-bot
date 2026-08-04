@@ -52,7 +52,17 @@ def _normalize_symbol(text: str) -> str:
     same token - strip everything but letters/digits and uppercase, so
     the comparison is purely against the exchange's raw slug
     ("BTCUSDT"), which is itself always upper-alnum-only.
+
+    Also strips a trailing ".P" / "-PERP" / "PERP" first - common
+    perpetual-contract notation (Binance/TradingView-style, e.g.
+    "BTCUSDT.P") that people type out of habit, but Bitget's own raw
+    symbols never carry it. Without this, "BTCUSDT.P" would get
+    normalized to the literal (non-existent) token "BTCUSDTP" and
+    always come back "not found", even with BTCUSDT futures sitting
+    right there in the token list.
     """
+    text = re.sub(r"\.p$", "", text.strip(), flags=re.IGNORECASE)
+    text = re.sub(r"-?perp(etual)?$", "", text, flags=re.IGNORECASE)
     return re.sub(r"[^A-Za-z0-9]", "", text).upper()
 
 

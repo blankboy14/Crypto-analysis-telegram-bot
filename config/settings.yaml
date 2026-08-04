@@ -86,18 +86,24 @@ volume_spike_watch:
 # above - this instead flags a pair the moment its traded volume
 # crosses a fixed absolute USDT amount within a rolling window,
 # regardless of what "normal" is for that pair (e.g. a pair that
-# usually does ~100k/interval suddenly trading 60M+ within 30 minutes).
+# usually does ~100k/interval suddenly trading 60M+ within 4 hours).
 absolute_volume_watch:
   enabled: true
   # The rolling comparison window - "X+ within THIS many seconds".
-  window_seconds: 1800  # 30 minutes
+  # 4 hours, not 30 minutes - $80M/$200M USDT moving through almost any
+  # pair within just 30 minutes was unrealistic (the threshold would
+  # essentially never trip); over a 4h window it's a genuinely rare,
+  # meaningful event worth flagging. Checked every poll_interval_seconds
+  # (volume_spike_watch, 5 min by default) and fires the INSTANT the
+  # scaled threshold is crossed - no extra waiting once it's crossed.
+  window_seconds: 14400  # 4 hours
   # Separate bars for a main coin (BTC/ETH/SOL/BNB - see
   # main_coin_watch.symbols below, shared by both features so the
   # "which pairs count as major" list only lives in one place) vs
   # everything else (treated as a meme/alt coin). A meme coin's
   # normal volume is usually far smaller, so in absolute-dollar terms
   # its bar is set HIGHER, not lower - $200M actually moving through a
-  # small-cap pair in 30 minutes is a much rarer, more extreme event
+  # small-cap pair in 4 hours is a much rarer, more extreme event
   # than the same dollar amount on BTC.
   main_coin_threshold_usdt: 80000000  # 80,000,000 USDT
   meme_coin_threshold_usdt: 200000000  # 200,000,000 USDT
@@ -213,6 +219,12 @@ strong_signal_watch:
   # reversal once the price drop threshold is hit (if order flow is
   # unavailable, the price drop alone is treated as sufficient).
   reversal_sell_flow_pct: 55.0
+  # If the drop off peak reaches reversal_drop_pct x this multiplier,
+  # fire regardless of what order flow says - price action that
+  # overwhelming is treated as sufficient evidence on its own (fixes a
+  # real bug: a single noisy 60s order-flow sample on a thin pair could
+  # otherwise block an obvious, already-large reversal indefinitely).
+  reversal_override_multiplier: 2.0
   # Trade plan levels for a pump-reversal SELL signal (there's no
   # normal indicator-based trade plan for these - they come from
   # price/order-flow, not engine.signal_scanner). Entry = current
@@ -243,6 +255,105 @@ strong_signal_watch:
   # counts as "this quiet pair just wasn't quiet anymore".
   early_watch_move_pct_threshold: 6.0
   early_watch_cooldown_seconds: 1800
+
+# --- Meme/Alt Coin Move watch add-on (rides the same "Find 24/7 Strong
+# Signal" ON/OFF toggle - no separate button, scheduled alongside the
+# jobs above whenever strong_signal_watch is turned on for a chat) ---
+# jobs/meme_move_watcher.py. Same daily-snapshot cumulative-%-move idea
+# as the pump/reversal add-on above, but simpler and fires in BOTH
+# directions with repeating checkpoints as the move keeps extending,
+# not just a single overextended threshold:
+#   UP:   first alert at up_first_pct, then again every further
+#         up_step_pct (default 60 -> 80 -> 100 -> 120 -> ...).
+#   DOWN: first alert at -down_first_pct, then again every further
+#         -down_step_pct (default -40 -> -50 -> -60 -> -70 -> ...).
+# Also watches for a snap-back the OTHER way off the current
+# peak/trough (reversal_pullback_pct in either direction) - a pump
+# that gives back that much off its peak, or a dump that bounces that
+# much off its trough - as its own separate alert.
+meme_move_watch:
+  window_days: 5
+  check_interval_seconds: 60
+  up_first_pct: 60.0
+  up_step_pct: 20.0
+  down_first_pct: 40.0
+  down_step_pct: 10.0
+  # % pullback off the peak (pump case) or bounce off the trough (dump
+  # case) that counts as a reversal worth flagging.
+  reversal_pullback_pct: 20.0
+  # Don't push the exact same pair+event-type again within this window.
+  cooldown_seconds: 3600
+  # --- separate, simpler 4H window check (see jobs/meme_move_watcher.py
+  # module docstring for exactly how this is computed without extra
+  # candle fetches) ---
+  four_h_window_hours: 4.0
+  # Traded USDT volume within that window - either direction.
+  four_h_volume_threshold_usdt: 200_000_000
+  four_h_volume_cooldown_seconds: 3600
+  # Raw price move % within that same window - either direction.
+  four_h_price_move_pct: 65.0
+  four_h_price_cooldown_seconds: 3600
+
+# --- High Alert Pair Analyse add-on (also rides the "Find 24/7 Strong
+# Signal" toggle - jobs/high_alert_watcher.py) ---
+# Runs the SAME full multi-timeframe indicator/concept engine as a
+# normal Strong Signal scan (engine.signal_scanner.analyze_one_pair),
+# but ONLY against the small pool of pairs state_store already has
+# flagged as overextended (get_overextended() - populated by the
+# pump/reversal check's pump_threshold_pct, 80%+ cumulative pump by
+# default) - cheap enough to run often since that pool is normally
+# tiny compared to the whole market, while still producing a real
+# indicator-confirmed SELL call with a full trade plan (not just the
+# price/order-flow heuristic the plain pump-reversal alert uses).
+high_alert_watch:
+  check_interval_seconds: 300
+  # Only push if the full scan's own combined confidence clears this -
+  # separate from (and typically lower than) min_confidence_to_push
+  # above, since being in the overextended pool is already itself a
+  # strong prior.
+  min_confidence_to_push: 65.0
+  cooldown_seconds: 3600
+
+# --- RSI Extreme watch add-on (also rides "Find 24/7 Strong Signal" -
+# jobs/rsi_extreme_watcher.py). Normal RSI reads 30-70; this watches
+# for RSI pushing into genuinely extreme territory in EITHER
+# direction, since a pair sitting there can turn any time:
+#   Overbought: first alert at high_first (85), then every further
+#     +high_step (95/105/115/...).
+#   Oversold: first alert at low_first (16), then every further
+#     -low_step (11/6/1/...).
+# Any pair currently past either threshold is ALSO folded into
+# jobs/high_alert_watcher.py's full-engine scan pool (overbought ->
+# scanned for SELL, oversold -> scanned for BUY) - same idea as the
+# pump/reversal add-on feeding that pool, just RSI-driven instead of
+# price-%-driven.
+#
+# RETEST: a pair only ever gets a 70/30 push if it was ACTUALLY
+# extreme first (crossed high_first/low_first above). Once it pulls
+# back through retest_high (70) or retest_low (30), that fires a
+# ONE-TIME retest alert and its tracking row is cleared. A pair that
+# just wanders across 70/30 on its own (never hit 85/16) is ignored -
+# this is what stops the 70/30 side from spamming.
+rsi_extreme_watch:
+  # Which candle timeframe(s) RSI is read from for this check
+  # specifically (independent of the 6-timeframe blend the full engine
+  # itself uses) - each tracked/alerted fully independently. Kept to
+  # just 4h (1h dropped - it was noisy enough to bounce across
+  # high_first/low_first repeatedly and also drove extra Bitget
+  # candle-fetch load/rate-limit errors). No code change needed to
+  # add timeframes back later - jobs/rsi_extreme_watcher.py already
+  # just iterates whatever's in this list.
+  timeframes: ["4h"]
+  candle_limit: 100
+  period: 14
+  check_interval_seconds: 300
+  high_first: 85.0
+  high_step: 10.0
+  low_first: 16.0
+  low_step: 5.0
+  retest_high: 70.0
+  retest_low: 30.0
+  cooldown_seconds: 3600
 
 # --- Phase 2.3: "Search Signal" one-shot scan ---
 search_signal:
@@ -285,6 +396,14 @@ symbols:
 signal_outcome_tracker:
   enabled: true
   poll_interval_seconds: 300  # 5 minutes
+
+# --- 🔁 Auto Backup (bot/handlers/backup.py, jobs/backup_watcher.py) ---
+# How often the scheduled database + logs zip gets sent automatically
+# to every chat with Auto Backup ON. Independent of 💾 Download
+# Database, which builds and sends one on demand any time regardless
+# of this toggle.
+backup_watch:
+  interval_hours: 1
 
 # --- Anti-sleep / status heartbeat (Render free-tier keep-alive) ---
 # The health-check server (bot/main.py) already keeps the process

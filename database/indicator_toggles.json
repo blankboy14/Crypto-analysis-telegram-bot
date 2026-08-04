@@ -1,5 +1,7 @@
 {
   "rsi": true,
+  "rsiDivergence": true,
+  "rsiMulti": true,
   "macd": true,
   "ema": true,
   "sma": true,

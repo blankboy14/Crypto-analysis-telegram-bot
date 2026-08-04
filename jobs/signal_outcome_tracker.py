@@ -81,14 +81,22 @@ def _get_candles(cache: dict, scope: str, raw_symbol: str):
     key = (scope, raw_symbol)
     if key in cache:
         return cache[key]
-    try:
-        if scope == "bitget-futures":
-            candles = fetch_bitget_futures_candles(raw_symbol, CANDLE_INTERVAL, limit=CANDLE_LIMIT)
-        else:
-            candles = fetch_bitget_spot_candles(raw_symbol, CANDLE_INTERVAL, limit=CANDLE_LIMIT)
-    except Exception as exc:
-        log.error(f"Signal outcome tracker: candle fetch failed for {raw_symbol} ({scope}): {exc}")
-        candles = None
+    candles = None
+    for attempt in range(2):  # one retry - several watchers now share Bitget's rate limit,
+        # so a transient 429 here is common; without a retry, this pair's TP/SL touch
+        # check just gets silently skipped for the whole tick, which is what made
+        # "Touched" status look stale/inconsistent from one check to the next.
+        try:
+            if scope == "bitget-futures":
+                candles = fetch_bitget_futures_candles(raw_symbol, CANDLE_INTERVAL, limit=CANDLE_LIMIT)
+            else:
+                candles = fetch_bitget_spot_candles(raw_symbol, CANDLE_INTERVAL, limit=CANDLE_LIMIT)
+            break
+        except Exception as exc:
+            if attempt == 0:
+                time.sleep(0.75)
+                continue
+            log.error(f"Signal outcome tracker: candle fetch failed for {raw_symbol} ({scope}) after retry: {exc}")
     cache[key] = candles
     return candles
 

@@ -14,6 +14,7 @@
 from .sma import compute_sma
 from .ema import compute_ema_series, compute_ema, compute_all_ema_periods
 from .rsi import compute_rsi
+from .rsi_divergence import compute_rsi_divergence
 from .stochastic_rsi import compute_stochastic_rsi
 from .macd import compute_macd
 from .bollinger_bands import compute_bollinger

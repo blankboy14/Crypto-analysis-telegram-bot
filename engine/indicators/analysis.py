@@ -18,8 +18,9 @@
 import logging
 
 from .sma import compute_sma
-from .ema import compute_ema, compute_all_ema_periods
-from .rsi import compute_rsi
+from .ema import compute_all_ema_periods
+from .rsi import compute_rsi, compute_multi_period_rsi
+from .rsi_divergence import compute_rsi_divergence
 from .stochastic_rsi import compute_stochastic_rsi
 from .macd import compute_macd
 from .bollinger_bands import compute_bollinger
@@ -42,11 +43,14 @@ from .volume_spikes import detect_volume_spikes
 
 log = logging.getLogger("crypto-analyzer-http")
 
-# The 22 indicators from the Phase 4.1 spec, in spec order. Shared with
+# The 22 original indicators from the Phase 4.1 spec, in spec order,
+# plus rsiDivergence (added on direct request - converted from a
+# TradingView Pine Script the user supplied, see rsi_divergence.py's
+# module docstring for the conversion notes). Shared with
 # http_server.py (toggle state defaults to True for every key here) and
 # the Indicators page (renders one toggle switch + one card per key).
 INDICATOR_KEYS = [
-    "rsi", "macd", "ema", "sma", "bollinger", "stochRsi", "atr", "adx",
+    "rsi", "rsiDivergence", "rsiMulti", "macd", "ema", "sma", "bollinger", "stochRsi", "atr", "adx",
     "superTrend", "vwap", "volumeProfile", "pivotPoints", "ichimoku",
     "parabolicSar", "cci", "mfi", "obv", "volumeAnalysis",
     "buySellVolume", "deltaVolume", "rvol", "volumeSpikes",
@@ -100,6 +104,8 @@ def compute_all_indicators(candles, enabled=None, return_errors=False):
 
     run("ema", lambda: compute_all_ema_periods(closes))
     run("rsi", lambda: compute_rsi(closes))
+    run("rsiDivergence", lambda: compute_rsi_divergence(candles))
+    run("rsiMulti", lambda: compute_multi_period_rsi(closes))
     run("stochRsi", lambda: compute_stochastic_rsi(closes))
     run("macd", lambda: compute_macd(closes))
     run("bollinger", lambda: compute_bollinger(closes))
@@ -116,7 +122,13 @@ def compute_all_indicators(candles, enabled=None, return_errors=False):
     run("obv", lambda: compute_obv(candles))
     run("volumeAnalysis", lambda: compute_volume_analysis(candles))
     run("buySellVolume", lambda: compute_buy_sell_volume(candles[-50:]))
-    run("deltaVolume", lambda: compute_delta_volume(candles[-50:]))
+    # A SHORTER window than buySellVolume's 50 candles on purpose - this
+    # is meant to read recent/short-term order flow momentum, distinct
+    # from buySellVolume's medium-term read. Using the same 50-candle
+    # window here (as before) made deltaVolume's "delta" field literally
+    # identical to buySellVolume's "delta" field - same function, same
+    # slice, same number under two different indicator names.
+    run("deltaVolume", lambda: compute_delta_volume(candles[-15:]))
     run("rvol", lambda: compute_rvol(candles))
     run("volumeSpikes", lambda: detect_volume_spikes(candles))
 

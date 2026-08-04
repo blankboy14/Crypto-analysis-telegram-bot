@@ -56,6 +56,9 @@ from telegram.ext import (
 from bot.keyboards import (
     BTN_HELP,
     BTN_CLEAN_CHAT,
+    BTN_DOWNLOAD_DB,
+    BTN_AUTO_BACKUP_ON,
+    BTN_AUTO_BACKUP_OFF,
     BTN_MARKET_ANALYSE_OFF,
     BTN_MARKET_ANALYSE_ON,
     BTN_MARKET_ANALYSE_STATUS,
@@ -67,12 +70,15 @@ from bot.keyboards import (
     BTN_STRONG_SIGNAL_OFF,
     BTN_STRONG_SIGNAL_ON,
     BTN_STRONG_SIGNAL_STATUS,
+    BTN_HIGH_ALERT_PAIRS,
     BTN_WALLET_BALANCE,
     BTN_SERVER_INFORMATION,
 )
 from bot.handlers import (
+    backup,
     clean_chat,
     help as help_handler,
+    high_alert_pairs,
     market_analyse,
     market_details,
     market_select,
@@ -86,7 +92,7 @@ from bot.handlers import (
     wallet_balance,
 )
 from bot.message_tracker import TrackingBot, track_incoming
-from jobs import heartbeat, keepalive, signal_outcome_tracker
+from jobs import backup_watcher, heartbeat, keepalive, signal_outcome_tracker
 from web.dashboard import start_dashboard_server
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -217,6 +223,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.Text([BTN_STRONG_SIGNAL_ON]), strong_signal.handle_on))
     application.add_handler(MessageHandler(filters.Text([BTN_STRONG_SIGNAL_OFF]), strong_signal.handle_off))
     application.add_handler(MessageHandler(filters.Text([BTN_STRONG_SIGNAL_STATUS]), status.handle_strong_signal_status))
+    application.add_handler(MessageHandler(filters.Text([BTN_HIGH_ALERT_PAIRS]), high_alert_pairs.handle))
     application.add_handler(MessageHandler(filters.Text([BTN_SEARCH_SIGNAL]), search_signal.handle))
     application.add_handler(MessageHandler(filters.Text([BTN_SEARCH_SIGNAL_STATUS]), status.handle_search_signal_status))
     application.add_handler(MessageHandler(filters.Text([BTN_TRADE_INFORMATION]), trade_information.handle))
@@ -237,6 +244,9 @@ def register_handlers(application: Application) -> None:
         CallbackQueryHandler(server_information.handle_choice, pattern=r"^server_info:")
     )
     application.add_handler(MessageHandler(filters.Text([BTN_CLEAN_CHAT]), clean_chat.handle))
+    application.add_handler(MessageHandler(filters.Text([BTN_DOWNLOAD_DB]), backup.handle_download))
+    application.add_handler(MessageHandler(filters.Text([BTN_AUTO_BACKUP_ON]), backup.handle_auto_on))
+    application.add_handler(MessageHandler(filters.Text([BTN_AUTO_BACKUP_OFF]), backup.handle_auto_off))
     application.add_handler(MessageHandler(filters.Text([BTN_HELP]), help_handler.handle))
 
     # message_tracker.track_incoming (see bot/message_tracker.py) - runs
@@ -302,6 +312,17 @@ def build_application(settings: dict) -> Application:
             interval=outcome_cfg.get("poll_interval_seconds", 300),
             first=15,
         )
+
+    # backup_watcher is ALSO global, same reasoning as
+    # signal_outcome_tracker above - one run covers every chat that has
+    # 🔁 Auto Backup ON (see jobs/backup_watcher.py + bot/handlers/
+    # backup.py for the full "why").
+    backup_cfg = settings.get("backup_watch", {})
+    application.job_queue.run_repeating(
+        backup_watcher.tick,
+        interval=backup_cfg.get("interval_hours", 6) * 3600,
+        first=60,
+    )
 
     # Anti-sleep heartbeat (see jobs/heartbeat.py) - HEARTBEAT_CHAT_ID
     # lives in .env (not settings.yaml) since it's a personal chat id,

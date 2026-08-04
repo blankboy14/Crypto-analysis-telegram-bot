@@ -199,7 +199,10 @@ def analyze_pair_multi_timeframe(raw_symbol, exchange, enabled_indicators, enabl
             continue
         indicators = compute_all_indicators(candles, enabled=enabled_indicators)
         concepts = compute_all_concepts(candles, enabled=enabled_concepts)
-        signal = compute_overall_signal(indicators, concepts, None, last_close=candles[-1]["close"])
+        signal = compute_overall_signal(
+            indicators, concepts, None, last_close=candles[-1]["close"],
+            last_open=candles[-1]["open"], last_candle_time=candles[-1]["time"],
+        )
         per_tf[tf] = {
             "score": signal["score"], "confidence": signal["confidence"],
             "verdict": signal["verdict"], "voteCount": signal["voteCount"],

@@ -120,9 +120,24 @@ def _run_pump_reversal_check(scopes: list, cfg: dict) -> list:
             price_by_symbol[raw_symbol] = (price, token["symbol"])
 
             state_store.record_daily_price(scope, raw_symbol, price)
-            cumulative_pct = state_store.get_cumulative_pct(scope, raw_symbol, window_days)
-            if cumulative_pct is not None and cumulative_pct >= pump_threshold:
-                state_store.flag_overextended(scope, raw_symbol, token["symbol"], cumulative_pct, price)
+            # Uses the PEAK-aware reading, not plain get_cumulative_pct -
+            # a pair that spikes hard and partially reverts within the
+            # same day would otherwise silently never cross
+            # pump_threshold at all, since get_cumulative_pct only ever
+            # compares each day's LATEST price, missing whatever peak
+            # was actually reached in between. See
+            # state_store.get_peak_cumulative_pct's docstring.
+            peak_result = state_store.get_peak_cumulative_pct(scope, raw_symbol, window_days)
+            if peak_result is not None:
+                cumulative_pct, peak_price_reached = peak_result
+                if cumulative_pct >= pump_threshold:
+                    # Flag using the ACTUAL peak price reached, not
+                    # today's live "now" price - if price has already
+                    # started sliding back by the time this tick runs,
+                    # the reversal-drop math below needs to measure from
+                    # where it truly topped out, not from a price that's
+                    # already partway down.
+                    state_store.flag_overextended(scope, raw_symbol, token["symbol"], cumulative_pct, peak_price_reached)
 
         for ov in state_store.get_overextended(scope):
             raw_symbol = ov["rawSymbol"]
@@ -153,8 +168,20 @@ def _run_pump_reversal_check(scopes: list, cfg: dict) -> list:
             # pressure before firing - a flaky/unavailable fetch
             # doesn't block the alert (the price drop is the primary
             # evidence), but a flow reading that's still buy-dominant
-            # means this isn't confirmed yet.
-            if sell_pct is not None and sell_pct < reversal_sell_flow_pct:
+            # means this isn't confirmed yet. EXCEPTION: once the drop
+            # is well past the threshold (reversal_override_multiplier x
+            # reversal_drop_pct), the price action itself is
+            # overwhelming enough evidence on its own - on a thin/
+            # low-liquidity pair, a single 60s order-flow sample can
+            # easily read buy-dominant by pure chance even mid-dump
+            # (a handful of small buys outweighing one big sell in
+            # trade COUNT, even while price keeps falling), and
+            # requiring it to agree first was silently blocking clearly
+            # real reversals tick after tick.
+            override_drop_pct = reversal_drop_pct * cfg.get("reversal_override_multiplier", 2.0)
+            flow_confirmed = sell_pct is None or sell_pct >= reversal_sell_flow_pct
+            price_overwhelming = drop_pct >= override_drop_pct
+            if not flow_confirmed and not price_overwhelming:
                 continue
 
             events.append({

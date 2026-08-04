@@ -260,10 +260,25 @@ def _init_schema() -> None:
                 raw_symbol TEXT NOT NULL,
                 day TEXT NOT NULL,
                 close_price REAL NOT NULL,
+                high_price REAL,
+                low_price REAL,
                 PRIMARY KEY (scope, raw_symbol, day)
             )
             """
         )
+        existing_pump_cols = {row[1] for row in con.execute("PRAGMA table_info(pump_price_history)").fetchall()}
+        if "high_price" not in existing_pump_cols:
+            # Pre-intraday-peak-tracking version of this table (close
+            # price only) - backfill high/low with whatever close_price
+            # already has, so old rows don't read back as NULL; going
+            # forward, record_daily_price keeps these as the TRUE
+            # intraday running max/min instead of just the latest tick's
+            # price (see that function's docstring for why this
+            # mattered - a pair that pumps hard and partially reverts
+            # within the same day was silently losing its peak here).
+            con.execute("ALTER TABLE pump_price_history ADD COLUMN high_price REAL")
+            con.execute("ALTER TABLE pump_price_history ADD COLUMN low_price REAL")
+            con.execute("UPDATE pump_price_history SET high_price = close_price, low_price = close_price WHERE high_price IS NULL")
         # One row per (scope, raw_symbol) - the CURRENT overextension
         # state, if any. `resolved`=0 means still being watched for a
         # reversal; a fresh flag_overextended() call always resets it
@@ -281,6 +296,89 @@ def _init_schema() -> None:
                 flagged_at TEXT NOT NULL,
                 resolved INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (scope, raw_symbol)
+            )
+            """
+        )
+
+        # --- meme/alt coin move tracking (jobs/meme_move_watcher.py) ---
+        # One row per (scope, raw_symbol) - the CURRENT up/down move
+        # being tracked, separate from overextended_pairs above (that
+        # table is specifically the pump-reversal SELL-call pipeline
+        # with its own entry/SL/TP semantics; this one is the simpler
+        # "still climbing/falling, checkpoint every N%, then flag if it
+        # snaps back" watch, in both directions).
+        #   direction         - "up" or "down": which side is being tracked.
+        #   last_announced_pct - the last checkpoint % already pushed
+        #                        (60/80/100/... or -40/-50/-60/...), so
+        #                        the SAME checkpoint never gets pushed
+        #                        twice.
+        #   extreme_price     - highest price seen since direction="up"
+        #                        started (or lowest, for "down") - what
+        #                        the reversal pullback/bounce % is
+        #                        measured against. Only ever moves
+        #                        further in the extreme direction.
+        #   reversal_announced - 1 once a pullback/bounce alert has
+        #                        fired for the CURRENT extreme_price -
+        #                        resets to 0 automatically whenever
+        #                        extreme_price reaches a new high/low,
+        #                        so a fresh peak/trough can still earn
+        #                        its own fresh reversal alert later.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meme_move_state (
+                scope TEXT NOT NULL,
+                raw_symbol TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                last_announced_pct REAL,
+                extreme_price REAL NOT NULL,
+                reversal_announced INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (scope, raw_symbol)
+            )
+            """
+        )
+
+        # --- RSI extreme checkpoint tracking (jobs/rsi_extreme_watcher.py) ---
+        # One row per (scope, raw_symbol, timeframe) currently sitting in
+        # extreme RSI territory on THAT timeframe - "high" (>=80,
+        # stepping to 90/100 - overbought, can reverse down anytime) or
+        # "low" (<=25, stepping to 20/15 - oversold, can reverse up
+        # anytime). Tracked per-timeframe (not just per-pair) because
+        # rsi_extreme_watch.timeframes checks more than one timeframe
+        # independently (1h and 4h by default) - a pair can easily be
+        # extreme on one and not the other, and each earns its own
+        # checkpoint sequence. Same checkpoint-stepping idea as
+        # meme_move_state above, just driven by the RSI reading itself
+        # instead of cumulative price %. While a pair has ANY row here
+        # (on any timeframe), jobs/high_alert_watcher.py's full-engine
+        # scan also includes it (see that module) - a "high" row is
+        # scanned looking for a SELL setup, a "low" row for a BUY setup.
+        existing_rsi_alert_cols = {
+            row[1] for row in con.execute("PRAGMA table_info(rsi_alert_state)").fetchall()
+        }
+        if existing_rsi_alert_cols and "timeframe" not in existing_rsi_alert_cols:
+            # Pre-multi-timeframe version of this table (single
+            # timeframe, no timeframe column at all) - the timeframe
+            # column is now part of the PRIMARY KEY, which SQLite can't
+            # add via ALTER TABLE. Safe to just drop and recreate: this
+            # table only ever holds LIVE tracking state (what's
+            # currently extreme right now), never history - losing it
+            # just means any pair's checkpoint sequence restarts from
+            # the first threshold next tick, not a real loss.
+            con.execute("DROP TABLE rsi_alert_state")
+
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rsi_alert_state (
+                scope TEXT NOT NULL,
+                raw_symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                last_announced_level REAL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (scope, raw_symbol, timeframe)
             )
             """
         )
@@ -657,27 +755,41 @@ def get_search_signal_status(chat_id: int) -> dict:
 
 def record_daily_price(scope: str, raw_symbol: str, price: float) -> None:
     """
-    Upserts today's (UTC) close snapshot for one pair. Safe to call on
-    every tick for every pair - same day's row just gets overwritten
-    with the latest price seen that day, so by end-of-day it holds
-    that day's last observed price.
+    Upserts today's (UTC) price info for one pair. Safe to call on
+    every tick for every pair. `close_price` is just the latest price
+    seen today (unchanged behavior - used by get_cumulative_pct's
+    "long-run drift" reading). `high_price`/`low_price` are the TRUE
+    running max/min seen today across every tick, not overwritten -
+    this is what get_peak_cumulative_pct uses, and it's the fix for a
+    real bug: a pair that pumps 100%+ and then partially reverts
+    WITHIN THE SAME DAY used to silently lose that peak, since the old
+    version of this function only kept whatever price the LAST tick of
+    the day happened to see - by which point a fast pump-and-dump could
+    already be back down, making the pair never actually cross the
+    overextended threshold even though it clearly should have.
     """
     day = datetime.now(timezone.utc).date().isoformat()
     with _connect() as con:
         con.execute(
-            "INSERT INTO pump_price_history (scope, raw_symbol, day, close_price) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(scope, raw_symbol, day) DO UPDATE SET close_price = excluded.close_price",
-            (scope, raw_symbol, day, price),
+            "INSERT INTO pump_price_history (scope, raw_symbol, day, close_price, high_price, low_price) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(scope, raw_symbol, day) DO UPDATE SET "
+            "  close_price = excluded.close_price, "
+            "  high_price = MAX(pump_price_history.high_price, excluded.high_price), "
+            "  low_price = MIN(pump_price_history.low_price, excluded.low_price)",
+            (scope, raw_symbol, day, price, price, price),
         )
 
 
 def get_cumulative_pct(scope: str, raw_symbol: str, window_days: int) -> float | None:
     """
-    % change from the OLDEST daily snapshot within the trailing
+    % change from the OLDEST daily CLOSE snapshot within the trailing
     `window_days` to the most recent one - approximates a multi-day
-    cumulative pump that a single 24h ticker figure can't see. Returns
-    None if there isn't at least 2 days of history yet for this pair
-    (not enough to judge a "cumulative" move from).
+    cumulative drift (up or down) that a single 24h ticker figure
+    can't see. Returns None if there isn't at least 2 days of history
+    yet for this pair. Note: this uses closes only, so it can
+    understate a pair that spiked and partially reverted within a
+    single day - see get_peak_cumulative_pct for that case.
     """
     with _connect() as con:
         rows = con.execute(
@@ -692,6 +804,47 @@ def get_cumulative_pct(scope: str, raw_symbol: str, window_days: int) -> float |
     if not oldest:
         return None
     return (latest - oldest) / oldest * 100
+
+
+def get_peak_cumulative_pct(scope: str, raw_symbol: str, window_days: int) -> tuple[float, float] | None:
+    """
+    Like get_cumulative_pct, but measured against the TRUE peak (for an
+    up move) or trough (for a down move) reached anywhere within the
+    window - not just the most recent day's closing snapshot. Returns
+    (pct, extreme_price) using whichever of high_price/low_price
+    produces the LARGER-magnitude move from the oldest day's close, or
+    None if there isn't at least 2 days of history yet.
+
+    This is what jobs/strong_signal_watcher.py's overextended-flagging
+    check uses (get_cumulative_pct alone isn't enough there) - a pair
+    that spikes 100%+ intraday and has already partially reverted by
+    the time a tick runs would otherwise never cross the 80% threshold
+    at all, since get_cumulative_pct only ever sees each day's LATEST
+    price, not its peak.
+    """
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT close_price, high_price, low_price FROM pump_price_history "
+            "WHERE scope = ? AND raw_symbol = ? ORDER BY day DESC LIMIT ?",
+            (scope, raw_symbol, window_days),
+        ).fetchall()
+    if len(rows) < 2:
+        return None
+    oldest_close = rows[-1][0]
+    if not oldest_close:
+        return None
+
+    highs = [r[1] for r in rows if r[1] is not None]
+    lows = [r[2] for r in rows if r[2] is not None]
+    peak_high = max(highs) if highs else rows[0][0]
+    peak_low = min(lows) if lows else rows[0][0]
+
+    up_pct = (peak_high - oldest_close) / oldest_close * 100
+    down_pct = (peak_low - oldest_close) / oldest_close * 100
+
+    if abs(up_pct) >= abs(down_pct):
+        return up_pct, peak_high
+    return down_pct, peak_low
 
 
 def prune_pump_history(older_than_days: int) -> None:
@@ -745,6 +898,90 @@ def resolve_overextended(scope: str, raw_symbol: str) -> None:
             "UPDATE overextended_pairs SET resolved = 1 WHERE scope = ? AND raw_symbol = ?",
             (scope, raw_symbol),
         )
+
+
+def get_meme_move_state(scope: str, raw_symbol: str) -> dict | None:
+    """Current up/down move-tracking state for one pair, or None if it's not currently in either direction's tracked zone."""
+    with _connect() as con:
+        row = con.execute(
+            "SELECT direction, last_announced_pct, extreme_price, reversal_announced FROM meme_move_state "
+            "WHERE scope = ? AND raw_symbol = ?",
+            (scope, raw_symbol),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "direction": row[0], "lastAnnouncedPct": row[1], "extremePrice": row[2],
+        "reversalAnnounced": bool(row[3]),
+    }
+
+
+def upsert_meme_move_state(scope: str, raw_symbol: str, symbol: str, direction: str,
+                            last_announced_pct: float | None, extreme_price: float,
+                            reversal_announced: bool) -> None:
+    """Overwrites (or creates) this pair's move-tracking row - callers always pass the FULL new state, not a delta, so a stale row from a previous direction never leaks into the new one."""
+    with _connect() as con:
+        con.execute(
+            "INSERT INTO meme_move_state (scope, raw_symbol, symbol, direction, last_announced_pct, extreme_price, reversal_announced, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(scope, raw_symbol) DO UPDATE SET "
+            "  symbol = excluded.symbol, direction = excluded.direction, "
+            "  last_announced_pct = excluded.last_announced_pct, extreme_price = excluded.extreme_price, "
+            "  reversal_announced = excluded.reversal_announced, updated_at = excluded.updated_at",
+            (scope, raw_symbol, symbol, direction, last_announced_pct, extreme_price, int(reversal_announced), _now()),
+        )
+
+
+def clear_meme_move_state(scope: str, raw_symbol: str) -> None:
+    """Drops this pair's tracked move entirely - called once its cumulative % move settles back into the neutral zone (between the down and up thresholds), so the NEXT pump or dump starts fresh from the first checkpoint again instead of resuming mid-sequence."""
+    with _connect() as con:
+        con.execute("DELETE FROM meme_move_state WHERE scope = ? AND raw_symbol = ?", (scope, raw_symbol))
+
+
+def get_rsi_alert_state(scope: str, raw_symbol: str, timeframe: str) -> dict | None:
+    """Current RSI-extreme tracking state for one pair ON ONE TIMEFRAME, or None if it's not currently past either threshold on that timeframe."""
+    with _connect() as con:
+        row = con.execute(
+            "SELECT direction, last_announced_level FROM rsi_alert_state "
+            "WHERE scope = ? AND raw_symbol = ? AND timeframe = ?",
+            (scope, raw_symbol, timeframe),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"direction": row[0], "lastAnnouncedLevel": row[1]}
+
+
+def upsert_rsi_alert_state(scope: str, raw_symbol: str, symbol: str, timeframe: str, direction: str,
+                            last_announced_level: float | None) -> None:
+    """Overwrites (or creates) this pair's RSI-extreme row for this ONE timeframe - callers always pass the FULL new state, same reasoning as upsert_meme_move_state."""
+    with _connect() as con:
+        con.execute(
+            "INSERT INTO rsi_alert_state (scope, raw_symbol, timeframe, symbol, direction, last_announced_level, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(scope, raw_symbol, timeframe) DO UPDATE SET "
+            "  symbol = excluded.symbol, direction = excluded.direction, "
+            "  last_announced_level = excluded.last_announced_level, updated_at = excluded.updated_at",
+            (scope, raw_symbol, timeframe, symbol, direction, last_announced_level, _now()),
+        )
+
+
+def clear_rsi_alert_state(scope: str, raw_symbol: str, timeframe: str) -> None:
+    """Drops this pair's RSI-extreme row for this ONE timeframe - called once RSI on that timeframe comes back inside the neutral band. A pair still extreme on another timeframe keeps that OTHER row (and stays in the High Alert pool through it)."""
+    with _connect() as con:
+        con.execute(
+            "DELETE FROM rsi_alert_state WHERE scope = ? AND raw_symbol = ? AND timeframe = ?",
+            (scope, raw_symbol, timeframe),
+        )
+
+
+def get_rsi_alert_pairs(scope: str) -> list[dict]:
+    """Every (pair, timeframe) currently flagged in `scope` - what jobs/high_alert_watcher.py folds into its full-engine scan pool alongside get_overextended(). A pair extreme on more than one timeframe appears once per timeframe here; the caller dedupes by rawSymbol since only one full-engine scan per pair is needed regardless of how many timeframes flagged it."""
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT raw_symbol, symbol, direction, timeframe FROM rsi_alert_state WHERE scope = ?",
+            (scope,),
+        ).fetchall()
+    return [{"rawSymbol": r[0], "symbol": r[1], "direction": r[2], "timeframe": r[3]} for r in rows]
 
 
 # --- indicator toggles (shipped defaults, database/indicator_toggles.json) ---

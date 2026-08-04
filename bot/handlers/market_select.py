@@ -28,7 +28,6 @@ propagating up and affecting anything else.
 """
 import asyncio
 import logging
-import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
