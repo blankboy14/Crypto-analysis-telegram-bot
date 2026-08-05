@@ -20,7 +20,7 @@ completely separate from the default executor. Nothing else in the
 bot should ever be submitted here except a full scan_market /
 scan_market_above_confidence call.
 
-MAX_CONCURRENT_SCANS = 3 sizing: the three FULL-SCAN call sites are
+MAX_CONCURRENT_SCANS = 2 sizing: the three FULL-SCAN call sites are
 market_select.py's Search Signal run, and strong_signal_watcher.py's
 per-market (spot/future/both) scan - at most 3 distinct markets can
 ever be full-scanning at once (strong_signal_watcher.py's own lock
@@ -39,7 +39,7 @@ whatever's already running rather than getting its own pool.
 """
 from concurrent.futures import ThreadPoolExecutor
 
-MAX_CONCURRENT_SCANS = 3
+MAX_CONCURRENT_SCANS = 2
 
 SCAN_EXECUTOR = ThreadPoolExecutor(
     max_workers=MAX_CONCURRENT_SCANS,
