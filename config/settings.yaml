@@ -197,7 +197,7 @@ strong_signal_watch:
   scan_interval_seconds: 600
   # Only push a signal to the user once its confidence is at/above this.
   min_confidence_to_push: 80
-  worker_count: 5
+  worker_count: 4
   # Don't push the exact same pair+verdict again within this window.
   cooldown_seconds: 3600
   # --- pump/reversal SELL-bias add-on ---
@@ -353,7 +353,7 @@ rsi_extreme_watch:
   candle_limit: 100
   period: 14
   check_interval_seconds: 300
-  worker_count: 3
+  worker_count: 2
   high_first: 85.0
   high_step: 10.0
   low_first: 16.0
@@ -364,7 +364,7 @@ rsi_extreme_watch:
 
 # --- Phase 2.3: "Search Signal" one-shot scan ---
 search_signal:
-  worker_count: 8
+  worker_count: 5
   top_n: 3
 
 # --- Wallet Balance / Money Management add-on ---
