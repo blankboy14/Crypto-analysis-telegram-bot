@@ -347,6 +347,7 @@ rsi_extreme_watch:
   candle_limit: 100
   period: 14
   check_interval_seconds: 300
+  worker_count: 5 
   high_first: 85.0
   high_step: 10.0
   low_first: 16.0
