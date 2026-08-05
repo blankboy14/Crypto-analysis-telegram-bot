@@ -273,7 +273,13 @@ strong_signal_watch:
 # much off its trough - as its own separate alert.
 meme_move_watch:
   window_days: 5
-  check_interval_seconds: 60
+  # How often this whole check re-runs. 120s (was 60s) - this job does
+  # a full-market DB read/write per pair every cycle; halving the
+  # frequency meaningfully cuts baseline background load on a
+  # resource-constrained (free-tier) instance without hurting
+  # responsiveness much - a pump crossing 60% is still caught within 2
+  # minutes, not 1.
+  check_interval_seconds: 120
   up_first_pct: 60.0
   up_step_pct: 20.0
   down_first_pct: 40.0
@@ -347,7 +353,7 @@ rsi_extreme_watch:
   candle_limit: 100
   period: 14
   check_interval_seconds: 300
-  worker_count: 5 
+  worker_count: 3
   high_first: 85.0
   high_step: 10.0
   low_first: 16.0
