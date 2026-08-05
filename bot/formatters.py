@@ -1,4 +1,4 @@
-﻿"""
+"""
 bot/formatters.py
 
 Turns raw signal-scanner / watcher output into the Markdown messages
@@ -1511,7 +1511,7 @@ def format_high_alert_pairs(pool: dict) -> str:
             if c["source"] == "pump":
                 detail = f"Pump +{c['cumulativePct']:.1f}% cumulative — flagged {_ago(c['flaggedAt'])}"
             else:
-                detail = f"RSI extreme on {c['timeframe']}"
+                detail = f"RSI extreme on {c['timeframe']} — flagged {_ago(c['flaggedAt'])}"
             lines.append(f"  • `{c['symbol']}` — {verdict_arrow}\n    {detail}")
 
     lines.append("")
