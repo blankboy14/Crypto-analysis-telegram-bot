@@ -126,7 +126,15 @@ async def start_watching(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     context.job_queue.run_repeating(
         rsi_extreme_watcher.tick,
         interval=rsi_extreme_interval,
-        first=rsi_extreme_interval,
+        # Deliberately offset from high_alert_interval above by 90s, not
+        # equal to it - both used to fire their FIRST (and then every
+        # subsequent) run at the exact same moment, since both defaulted
+        # to the same 300s interval used for both `first` and `interval`.
+        # Two heavy jobs spiking memory/CPU simultaneously (high_alert's
+        # full 6-timeframe engine scan + rsi_extreme's threaded
+        # whole-market candle fetches) is what crashed a free-tier
+        # instance - staggering the phase spreads that load out instead.
+        first=rsi_extreme_interval + 90,
         chat_id=chat_id,
         data={"market": market},
         name=_rsi_extreme_job_name(chat_id),
