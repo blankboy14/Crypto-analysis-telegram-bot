@@ -67,7 +67,7 @@ def _build_pool(scopes: list[str]) -> dict[str, list[dict]]:
                 "source": "rsi",
                 "expectedVerdict": "SELL" if r["direction"] == "high" else "BUY",
                 "timeframe": r["timeframe"],
-                "flaggedAt": None,  # rsi_alert_state doesn't track a flagged-at timestamp
+                "flaggedAt": r["flaggedAt"],
             }
 
         pool[scope] = sorted(candidates.values(), key=lambda c: c["symbol"])
