@@ -377,11 +377,24 @@ def _init_schema() -> None:
                 symbol TEXT NOT NULL,
                 direction TEXT NOT NULL,
                 last_announced_level REAL,
+                flagged_at TEXT,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (scope, raw_symbol, timeframe)
             )
             """
         )
+        existing_rsi_alert_cols2 = {
+            row[1] for row in con.execute("PRAGMA table_info(rsi_alert_state)").fetchall()
+        }
+        if "flagged_at" not in existing_rsi_alert_cols2:
+            # Simple additive column - lets bot/handlers/high_alert_pairs.py
+            # show "how long ago" for RSI-sourced pairs too, same as
+            # pump-sourced ones already show via overextended_pairs.
+            # flagged_at itself is only ever SET on a fresh streak (see
+            # upsert_rsi_alert_state) and preserved across checkpoint
+            # updates within that same streak, so it means "when this
+            # streak started", not "when this row last changed".
+            con.execute("ALTER TABLE rsi_alert_state ADD COLUMN flagged_at TEXT")
 
 
 _init_schema()
@@ -942,26 +955,27 @@ def get_rsi_alert_state(scope: str, raw_symbol: str, timeframe: str) -> dict | N
     """Current RSI-extreme tracking state for one pair ON ONE TIMEFRAME, or None if it's not currently past either threshold on that timeframe."""
     with _connect() as con:
         row = con.execute(
-            "SELECT direction, last_announced_level FROM rsi_alert_state "
+            "SELECT direction, last_announced_level, flagged_at FROM rsi_alert_state "
             "WHERE scope = ? AND raw_symbol = ? AND timeframe = ?",
             (scope, raw_symbol, timeframe),
         ).fetchone()
     if row is None:
         return None
-    return {"direction": row[0], "lastAnnouncedLevel": row[1]}
+    return {"direction": row[0], "lastAnnouncedLevel": row[1], "flaggedAt": row[2]}
 
 
 def upsert_rsi_alert_state(scope: str, raw_symbol: str, symbol: str, timeframe: str, direction: str,
                             last_announced_level: float | None) -> None:
-    """Overwrites (or creates) this pair's RSI-extreme row for this ONE timeframe - callers always pass the FULL new state, same reasoning as upsert_meme_move_state."""
+    """Overwrites (or creates) this pair's RSI-extreme row for this ONE timeframe - callers always pass the FULL new state, same reasoning as upsert_meme_move_state. flagged_at is set only on a brand-new row (INSERT) and left untouched on every later checkpoint update (ON CONFLICT) within that same streak - it means "when this streak started", not "when this row last changed"."""
+    now = _now()
     with _connect() as con:
         con.execute(
-            "INSERT INTO rsi_alert_state (scope, raw_symbol, timeframe, symbol, direction, last_announced_level, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO rsi_alert_state (scope, raw_symbol, timeframe, symbol, direction, last_announced_level, flagged_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(scope, raw_symbol, timeframe) DO UPDATE SET "
             "  symbol = excluded.symbol, direction = excluded.direction, "
             "  last_announced_level = excluded.last_announced_level, updated_at = excluded.updated_at",
-            (scope, raw_symbol, timeframe, symbol, direction, last_announced_level, _now()),
+            (scope, raw_symbol, timeframe, symbol, direction, last_announced_level, now, now),
         )
 
 
@@ -978,10 +992,10 @@ def get_rsi_alert_pairs(scope: str) -> list[dict]:
     """Every (pair, timeframe) currently flagged in `scope` - what jobs/high_alert_watcher.py folds into its full-engine scan pool alongside get_overextended(). A pair extreme on more than one timeframe appears once per timeframe here; the caller dedupes by rawSymbol since only one full-engine scan per pair is needed regardless of how many timeframes flagged it."""
     with _connect() as con:
         rows = con.execute(
-            "SELECT raw_symbol, symbol, direction, timeframe FROM rsi_alert_state WHERE scope = ?",
+            "SELECT raw_symbol, symbol, direction, timeframe, flagged_at FROM rsi_alert_state WHERE scope = ?",
             (scope,),
         ).fetchall()
-    return [{"rawSymbol": r[0], "symbol": r[1], "direction": r[2], "timeframe": r[3]} for r in rows]
+    return [{"rawSymbol": r[0], "symbol": r[1], "direction": r[2], "timeframe": r[3], "flaggedAt": r[4]} for r in rows]
 
 
 # --- indicator toggles (shipped defaults, database/indicator_toggles.json) ---
